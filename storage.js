@@ -1154,6 +1154,9 @@ function readStaticUnitProps(conn, unit, handleProps){
 	var props = assocCachedUnits[unit];
 	if (props)
 		return handleProps(props);
+	if (unit == null) {
+        return handleProps({level: 0, witnessed_level: 0, best_parent_unit: null, witness_list_unit: null});
+    }
 	conn.query("SELECT level, witnessed_level, best_parent_unit, witness_list_unit FROM units WHERE unit=?", [unit], function(rows){
 		if (rows.length !== 1)
 			throw Error("not 1 unit");
