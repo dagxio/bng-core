@@ -482,6 +482,7 @@ function saveJoint(objJoint, objValidationState, preCommitCallback, onDone) {
 							arrOps.push(function(cb){
 								console.log("updating MC after adding "+objUnit.unit);
 								main_chain.updateMainChain(conn, null, objUnit.unit, cb);
+								eventBus.emit('new_unit', objJoint);
 							});
 						}
 						if (preCommitCallback)
