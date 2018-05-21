@@ -10,6 +10,8 @@ exports.COUNT_MC_BALLS_FOR_PAID_WITNESSING = 100;
 exports.version = 'bsure1.0';
 exports.alt = '8';
 
+exports.bTestnet = (exports.alt === '2' && exports.version === '1.0t');
+
 exports.GENESIS_UNIT ="FU/BaO/ot6zEV0peNe0qqqOyoj72QeTITt/89oQlnPM=";
 exports.BLACKBYTES_ASSET = '+w8UspBtcWW2Jc+xsSaRvKWZCVBRWgjDSMUMrUIzjUA=';
 
@@ -33,8 +35,16 @@ exports.MAX_AUTHENTIFIER_LENGTH = 4096;
 exports.MAX_CAP = 9e15;
 exports.MAX_COMPLEXITY = 100;
 
+exports.MAX_PROFILE_FIELD_LENGTH = 50;
+exports.MAX_PROFILE_VALUE_LENGTH = 100;
+
 exports.TEXTCOIN_CLAIM_FEE = 548;
 exports.TEXTCOIN_ASSET_CLAIM_FEE = 750;
 exports.TEXTCOIN_ASSET_CLAIM_HEADER_FEE = 391;
 exports.TEXTCOIN_ASSET_CLAIM_MESSAGE_FEE = 209;
 exports.TEXTCOIN_ASSET_CLAIM_BASE_MSG_FEE = 158;
+
+exports.minCoreVersion = exports.bTestnet ? '0.2.89' : '0.2.70';
+
+exports.spendUnconfirmedUpgradeMci = exports.bTestnet ? 589000 : 2609000;
+exports.branchedMinMcWlUpgradeMci = exports.bTestnet ? 593000 : 2609000;

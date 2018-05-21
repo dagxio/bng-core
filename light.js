@@ -175,6 +175,8 @@ function prepareHistory(historyRequest, callbacks){
 	if (arrAddresses){
 		if (!ValidationUtils.isNonemptyArray(arrAddresses))
 			return callbacks.ifError("no addresses");
+		if (!arrAddresses.every(ValidationUtils.isValidAddress))
+			return callbacks.ifError("some addresses are not valid");
 		if (arrKnownStableUnits && !ValidationUtils.isNonemptyArray(arrKnownStableUnits))
 			return callbacks.ifError("known_stable_units must be non-empty array");
 	}
@@ -375,7 +377,7 @@ function processHistory(objResponse, callbacks){
 									unlock();
 									return callbacks.ifOk(true);
 								}
-								db.query("UPDATE units SET is_stable=1, is_free=0 WHERE unit IN(?)", [arrProvenUnits], function(){
+								db.query("UPDATE units SET is_stable=1, is_free=0 WHERE unit IN("+arrProvenUnits.map(db.escape).join(', ')+")", function(){
 									unlock();
 									arrProvenUnits = arrProvenUnits.filter(function(unit){ return !assocProvenUnitsNonserialness[unit]; });
 									if (arrProvenUnits.length === 0)

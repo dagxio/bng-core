@@ -152,6 +152,13 @@ function saveJoint(objJoint, objValidationState, preCommitCallback, onDone) {
 							var attestation = message.payload;
 							conn.addQuery(arrQueries, "INSERT INTO attestations (unit, message_index, attestor_address, address) VALUES(?,?,?,?)", 
 								[objUnit.unit, i, objUnit.authors[0].address, attestation.address]);
+							for (var field in attestation.profile){
+								var value = attestation.profile[field];
+								if (field.length <= constants.MAX_PROFILE_FIELD_LENGTH && typeof value === 'string' && value.length <= constants.MAX_PROFILE_VALUE_LENGTH)
+									conn.addQuery(arrQueries, 
+										"INSERT INTO attested_fields (unit, message_index, attestor_address, address, field, value) VALUES(?,?, ?,?, ?,?)",
+										[objUnit.unit, i, objUnit.authors[0].address, attestation.address, field, value]);
+							}
 							break;
 						case "asset":
 							var asset = message.payload;
@@ -482,7 +489,6 @@ function saveJoint(objJoint, objValidationState, preCommitCallback, onDone) {
 							arrOps.push(function(cb){
 								console.log("updating MC after adding "+objUnit.unit);
 								main_chain.updateMainChain(conn, null, objUnit.unit, cb);
-								eventBus.emit('new_unit', objJoint);
 							});
 						}
 						if (preCommitCallback)
