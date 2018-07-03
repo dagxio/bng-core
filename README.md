@@ -1,17 +1,23 @@
-# Byteball core
+# [DAGX | 基于DAG的价值互联与交换网络](http://dagx.io "dagx官网")
 
-This is a library used in [Byteball](https://byteball.org) clients.  Never used directly.  Some of the clients that require the library:
+DAGX Networks 是基于 DAG 技术开发的价值交换网络，新一代基于有向无环图的分布式账本技术（DLT）。“ X ” 代表基于 DAG 区块链技术的 “价值互联与交换”，赋能保险科技、医疗健康等行业。 DAGX 公链1.0已完成并上线测试。依托中钰资本在医疗健康和保险科技的丰富资源，Bsure DAPP落地。DAGX基金会打造健康与保险行业数字资产公链生态，并助力企业运用 DAGX 开放的平台与技术实现企业资产上链和价值互联、交换。
 
-* [Byteball](../../../byteball) - GUI wallet for Mac, Windows, Linux, iOS, and Android.
-* [Headless Byteball](../../../headless-byteball) - headless wallet, primarily for server side use.
-* [Byteball Relay](../../../byteball-relay) - relay node for Byteball network.  It doesn't hold any private keys.
-* [Byteball Hub](../../../byteball-hub) - hub for Byteball network.  Includes the relay, plus can store and forward end-to-end encrypted messages among devices on the Byteball network.
+- 高并发
+- 可扩展
+- 双合约
+- BAAS
+- 快支付
+- 挖矿
+- 高安全
+- 应用多
+## 基于DAG的价值交换网络
+DAGX Networks 是新一代基于有向无环图分布式账本技术（DAG）的商用价值交换网络， X 代表“价值互联与交换”。DAGX Networks 致力推动实体经济与价值互联网连接融合，赋能行业与企业资产价值上链、流通与交换，实现数字经济价值重构和价值创造。 DAGX团队认为：下一代价值互联网将会是多维多链的网络生态，就像繁荣的生物世界。目前行业主流专家依然从传统历史进行推断，认为未来DLT生态发展类似操作系统，只有3-4种主流区块链得以延续发展。DAGX团队对未来有更宏远而不同的判断： 区块链正在带来生产关系的彻底变革，实现价值互联和流通交换体系的重构。区块链通过全球多个价值交换网络和分布式多维逻辑功能链层进行资产价值互联、流通交换， 从而构筑崭新繁荣的多维多链新世界。 
 
-## Developer guides
+DAGX团队创造性提出了DAGX Value Layers分层架构体系，由不同功能层次化的逻辑功能链组成DAGX Network价值交换网络，积极推动多维多链的下一代价值互联网应用落地。
 
-See the [wiki](https://github.com/byteball/byteballcore/wiki/Byteball-Developer-Guides).  Many of the features are not documented yet, see other [byteball repositories](https://github.com/byteball) as samples, for APIs see the `exports` of node.js modules.
+DAGX公链1.0已完成开发和上线测试，并在医疗健康、保险科技等多行业展开落地合作。依托中钰资本等合作方丰富的医疗健康资源，DAGX重点赋能 “医疗健康、保险互助” 行业，打造健康与保险行业数字资产公链生态，推动各行业企业实现资产上链和价值互联、交换。
 
-## Configuring
+## 配置
 
 The default settings are in the library's [conf.js](conf.js), they can be overridden in your project root's conf.js (see the clients above as examples), then in conf.json in the app data folder.  The app data folder is:
 
@@ -21,17 +27,9 @@ The default settings are in the library's [conf.js](conf.js), they can be overri
 
 `<appname>` is `name` in your `package.json`.
 
-### Settings
-
-This is the list of some of the settings that the library understands (your app can add more settings that only your app understands):
-
-#### conf.port
-
-The port to listen on.  If you don't want to accept incoming connections at all, set port to `null`, which is the default.  If you do want to listen, you will usually have a proxy, such as nginx, accept websocket connections on standard port 443 and forward them to your byteball daemon that listens on port 6611 on the local interface.
-
 #### conf.storage
 
-Storage backend -- mysql or sqlite, the default is sqlite.  If sqlite, the database files are stored in the app data folder.  If mysql, you need to also initialize the database with [byteball.sql](byteball.sql) and set connection params, e.g. in conf.json in the app data folder:
+默认数据库使用的是sqlite，保存在应用目录， 如果打算使用 mysql, 你需要在conf.json 中添加如下配置:
 
 ```json
 {
@@ -40,70 +38,14 @@ Storage backend -- mysql or sqlite, the default is sqlite.  If sqlite, the datab
 	"database": {
 		"max_connections": 30,
 		"host"     : "localhost",
-		"user"     : "byteball",
+		"user"     : "dagx",
 		"password" : "yourmysqlpassword",
-		"name"     : "byteball"
+		"name"     : "dagx"
 	}
 }
 ```
 #### conf.bLight
 
-Work as light client (`true`) or full node (`false`).  The default is full client.
-
-#### conf.bServeAsHub
-
-Whether to serve as hub on the Byteball network (store and forward e2e-encrypted messages for devices that connect to your hub).  The default is `false`.
-
-#### conf.myUrl
-
-If your node accepts incoming connections, this is its URL.  The node will share this URL with all its outgoing peers so that they can reconnect in any direction in the future.  By default the node doesn't share its URL even if it accepts connections.
-
-#### conf.bWantNewPeers
-
-Whether your node wants to learn about new peers from its current peers (`true`, the default) or not (`false`).  Set it to `false` to run your node in stealth mode so that only trusted peers can see its IP address (e.g. if you have online wallets on your server and don't want potential attackers to learn its IP).
-
-#### conf.socksHost, conf.socksPort, and conf.socksLocalDNS
-
-Settings for connecting through optional SOCKS5 proxy.  Use them to connect through TOR and hide your IP address from peers even when making outgoing connections.  This is useful and highly recommended when you are running an online wallet on your server and want to make it harder for potential attackers to learn the IP address of the target to attack.  Set `socksLocalDNS` to `false` to route DNS queries through TOR as well.
-
-#### MySQL conf for faster syncing
-
-To lower disk load and increase sync speed, you can optionally disable flushing to disk every transaction, instead doing it once a second. This can be done by setting `innodb_flush_log_at_trx_commit=0` in your MySQL server config file (my.ini)
-
-## Accepting incoming connections
-
-Byteball network works over secure WebSocket protocol wss://.  To accept incoming connections, you'll need a valid TLS certificate (you can get a free one from [letsencrypt.org](https://letsencrypt.org)) and a domain name (you can get a free domain from [Freenom](http://www.freenom.com/)).  Then you accept connections on standard port 443 and proxy them to your locally running byteball daemon.
-
-This is an example configuration for nginx to accept websocket connections at wss://byteball.one/bb and forward them to locally running daemon that listens on port 6611:
-
-```nginx
-server {
-	listen 80 default_server;
-	listen [::]:80 default_server;
-	listen 443 ssl;
-	listen [::]:443 ssl;
-	ssl_certificate "/etc/letsencrypt/live/byteball.one/fullchain.pem";
-	ssl_certificate_key "/etc/letsencrypt/live/byteball.one/privkey.pem";
-
-	if ($host != "byteball.one") {
-		rewrite ^(.*)$ https://byteball.one$1 permanent;
-	}
-	if ($https != "on") {
-		rewrite ^(.*)$ https://byteball.one$1 permanent;
-	}
-
-	location = /bb {
-		proxy_pass http://localhost:6611;
-		proxy_http_version 1.1;
-		proxy_set_header X-Real-IP $remote_addr;
-		proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-		proxy_set_header Upgrade $http_upgrade;
-		proxy_set_header Connection "upgrade";
-	}
-
-	root /var/www/html;
-	server_name _;
-}
-```
-
+轻钱包 (`true`) | 全钱包 (`false`)  
+默认是全钱包
 
