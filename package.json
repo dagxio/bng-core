@@ -1,20 +1,20 @@
 {
-  "name": "byteballcore",
-  "description": "Byteball Core",
-  "author": "Byteball",
+  "name": "bng-core",
+  "description": "bng core",
+  "author": "dagx",
   "version": "0.2.93",
   "keywords": [
     "byteball",
     "multisignature"
   ],
-  "homepage": "https://github.com/byteball/byteballcore",
+  "homepage": "https://github.com/dagxio/bng-core",
   "license": "MIT",
   "repository": {
-    "url": "git://github.com/byteball/byteballcore.git",
+    "url": "git://github.com/dagxio/bng-core.git",
     "type": "git"
   },
   "bugs": {
-    "url": "https://github.com/byteball/byteballcore/issues"
+    "url": "https://github.com/dagxio/bng-core/issues"
   },
   "browser": {
     "request": "browser-request",
