@@ -86,7 +86,8 @@ function readDependentJointsThatAreReady(unit, handleDependentJoint){
 	var t=Date.now();
 	var from = unit ? "FROM dependencies AS src_deps JOIN dependencies USING(unit)" : "FROM dependencies";
 	var where = unit ? "WHERE src_deps.depends_on_unit="+db.escape(unit) : "";
-	mutex.lock(["dependencies"], function(unlock){
+	var lock = unit ? mutex.lock : mutex.lockOrSkip;
+	lock(["dependencies"], function(unlock){
 		db.query(
 			"SELECT dependencies.unit, unhandled_joints.unit AS unit_for_json, \n\
 				SUM(CASE WHEN units.unit IS NULL THEN 1 ELSE 0 END) AS count_missing_parents \n\
@@ -191,7 +192,12 @@ function collectQueriesToPurgeDependentJoints(conn, arrQueries, unit, error, onP
 
 function purgeUncoveredNonserialJointsUnderLock(){
 	mutex.lockOrSkip(["purge_uncovered"], function(unlock){
-		purgeUncoveredNonserialJoints(false, unlock);
+		mutex.lock(["handleJoint"], function(unlock_hj){
+			purgeUncoveredNonserialJoints(false, function(){
+				unlock_hj();
+				unlock();
+			});
+		});
 	});
 }
 
@@ -210,7 +216,8 @@ function purgeUncoveredNonserialJoints(bByExistenceOfChildren, onDone){
 				WHERE wunits."+order_column+" > units."+order_column+" \n\
 				LIMIT 0,1 \n\
 			)) \n\
-			/* AND NOT EXISTS (SELECT * FROM unhandled_joints) */", 
+			/* AND NOT EXISTS (SELECT * FROM unhandled_joints) */ \n\
+		ORDER BY units."+order_column+" DESC", 
 		// some unhandled joints may depend on the unit to be archived but it is not in dependencies because it was known when its child was received
 	//	[constants.MAJORITY_OF_WITNESSES - 1],
 		function(rows){
@@ -230,8 +237,6 @@ function purgeUncoveredNonserialJoints(bByExistenceOfChildren, onDone){
 									archiving.generateQueriesToArchiveJoint(conn, objJoint, 'uncovered', arrQueries, function(){
 										conn.addQuery(arrQueries, "COMMIT");
 										async.series(arrQueries, function(){
-											unlock();
-											conn.release();
 											breadcrumbs.add("------- done archiving "+row.unit);
 											var parent_units = storage.assocUnstableUnits[row.unit].parent_units;
 											storage.forgetUnit(row.unit);
@@ -247,6 +252,8 @@ function purgeUncoveredNonserialJoints(bByExistenceOfChildren, onDone){
 												if (!bHasChildren)
 													storage.assocUnstableUnits[parent_unit].is_free = 1;
 											});
+											unlock();
+											conn.release();
 											cb();
 										});
 									});

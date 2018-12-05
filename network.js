@@ -22,8 +22,10 @@ var objectHash = require('./object_hash.js');
 var ecdsaSig = require('./signature.js');
 var eventBus = require('./event_bus.js');
 var light = require('./light.js');
+var inputs = require('./inputs.js');
 var breadcrumbs = require('./breadcrumbs.js');
 var mail = process.browser ? null : require('./mail.js'+'');
+var libraryPackageJson = require('./package.json');
 
 var FORWARDING_TIMEOUT = 10*1000; // don't forward if the joint was received more than FORWARDING_TIMEOUT ms ago
 var STALLED_TIMEOUT = 5000; // a request is treated as stalled if no response received within STALLED_TIMEOUT ms
@@ -46,6 +48,7 @@ var arrWatchedAddresses = []; // does not include my addresses, therefore always
 var last_hearbeat_wake_ts = Date.now();
 var peer_events_buffer = [];
 var assocKnownPeers = {};
+var assocBlockedPeers = {};
 var exchangeRates = {};
 
 if (process.browser){ // browser
@@ -94,7 +97,14 @@ function sendMessage(ws, type, content) {
 	if (ws.readyState !== ws.OPEN)
 		return console.log("readyState="+ws.readyState+' on peer '+ws.peer+', will not send '+message);
 	console.log("SENDING "+message+" to "+ws.peer);
-	ws.send(message);
+	if (typeof window !== 'undefined' && window && window.cordova) {
+		ws.send(message);
+	} else {
+		ws.send(message, function(err){
+			if (err)
+				ws.emit('error', 'From send: '+err);
+		});
+	}
 }
 
 function sendJustsaying(ws, subject, body){
@@ -124,7 +134,6 @@ function sendErrorResult(ws, unit, error) {
 }
 
 function sendVersion(ws){
-	var libraryPackageJson = require('./package.json');
 	sendJustsaying(ws, 'version', {
 		protocol_version: constants.version, 
 		alt: constants.alt, 
@@ -143,6 +152,7 @@ function sendResponse(ws, tag, response){
 function sendErrorResponse(ws, tag, error) {
 	sendResponse(ws, tag, {error: error});
 }
+
 
 // if a 2nd identical request is issued before we receive a response to the 1st request, then:
 // 1. its responseHandler will be called too but no second request will be sent to the wire
@@ -204,7 +214,34 @@ function sendRequest(ws, command, params, bReroutable, responseHandler){
 		};
 		sendMessage(ws, 'request', content);
 	}
+	return tag;
 }
+
+
+function deletePendingRequest(ws, tag){
+	if (ws && ws.assocPendingRequests && ws.assocPendingRequests[tag]){
+		var pendingRequest = ws.assocPendingRequests[tag];
+		clearTimeout(pendingRequest.reroute_timer);
+		clearTimeout(pendingRequest.cancel_timer);
+		delete ws.assocPendingRequests[tag];
+
+		// if the request was rerouted, cancel all other pending requests
+		if (assocReroutedConnectionsByTag[tag]){
+			assocReroutedConnectionsByTag[tag].forEach(function(client){
+				if (client.assocPendingRequests[tag]){
+					clearTimeout(client.assocPendingRequests[tag].reroute_timer);
+					clearTimeout(client.assocPendingRequests[tag].cancel_timer);
+					delete client.assocPendingRequests[tag];
+				}
+			});
+			delete assocReroutedConnectionsByTag[tag];
+		}
+		return true;
+	}else{
+		return false;
+	}
+}
+
 
 function handleResponse(ws, tag, response){
 	var pendingRequest = ws.assocPendingRequests[tag];
@@ -216,22 +253,8 @@ function handleResponse(ws, tag, response){
 			responseHandler(ws, pendingRequest.request, response);
 		});
 	});
-	
-	clearTimeout(pendingRequest.reroute_timer);
-	clearTimeout(pendingRequest.cancel_timer);
-	delete ws.assocPendingRequests[tag];
-	
-	// if the request was rerouted, cancel all other pending requests
-	if (assocReroutedConnectionsByTag[tag]){
-		assocReroutedConnectionsByTag[tag].forEach(function(client){
-			if (client.assocPendingRequests[tag]){
-				clearTimeout(client.assocPendingRequests[tag].reroute_timer);
-				clearTimeout(client.assocPendingRequests[tag].cancel_timer);
-				delete client.assocPendingRequests[tag];
-			}
-		});
-		delete assocReroutedConnectionsByTag[tag];
-	}
+
+	deletePendingRequest(ws, tag);
 }
 
 function cancelRequestsOnClosedConnection(ws){
@@ -494,6 +517,16 @@ function getPeerWebSocket(peer){
 	return null;
 }
 
+function getInboundDeviceWebSocket(device_address){
+	for (var i=0; i<wss.clients.length; i++){
+		if (wss.clients[i].device_address === device_address)
+			return wss.clients[i];
+	}
+	return null;
+}
+
+
+
 function findOutboundPeerOrConnect(url, onOpen){
 	if (!url)
 		throw Error('no url');
@@ -526,11 +559,10 @@ function findOutboundPeerOrConnect(url, onOpen){
 }
 
 function purgePeerEvents(){
-    if (conf.storage !== 'sqlite') {
+    if (conf.storage !== 'sqlite')
         return;
-    }
     console.log('will purge peer events');
-    db.query("DELETE FROM peer_events WHERE event_date <= datetime('now', '-3 day')", function() {
+    db.query("DELETE FROM peer_events WHERE event_date <= datetime('now', '-0.5 day')", function() {
         console.log("deleted some old peer_events");
     });
 }
@@ -648,7 +680,7 @@ function printConnectionStatus(){
 function subscribe(ws){
 	ws.subscription_id = crypto.randomBytes(30).toString("base64"); // this is to detect self-connect
 	storage.readLastMainChainIndex(function(last_mci){
-		sendRequest(ws, 'subscribe', {subscription_id: ws.subscription_id, last_mci: last_mci}, false, function(ws, request, response){
+		sendRequest(ws, 'subscribe', {subscription_id: ws.subscription_id, last_mci: last_mci, library_version: libraryPackageJson.version}, false, function(ws, request, response){
 			delete ws.subscription_id;
 			if (response.error)
 				return;
@@ -668,7 +700,7 @@ function sendJoint(ws, objJoint, tag) {
 
 // sent by light clients to their vendors
 function postJointToLightVendor(objJoint, handleResponse) {
-	console.log('posing joint identified by unit ' + objJoint.unit.unit + ' to light vendor');
+	console.log('posting joint identified by unit ' + objJoint.unit.unit + ' to light vendor');
 	requestFromLightVendor('post_joint', objJoint, function(ws, request, response){
 		handleResponse(response);
 	});
@@ -839,7 +871,7 @@ function havePendingJointRequest(unit){
 
 // We may receive a reference to a nonexisting unit in parents. We are not going to keep the referencing joint forever.
 function purgeJunkUnhandledJoints(){
-	if (bCatchingUp || Date.now() - coming_online_time < 3600*1000)
+	if (bCatchingUp || Date.now() - coming_online_time < 3600*1000 || wss.clients.length === 0 && arrOutboundPeers.length === 0)
 		return;
 	db.query("DELETE FROM unhandled_joints WHERE creation_date < "+db.addTime("-1 HOUR"), function(){
 		db.query("DELETE FROM dependencies WHERE NOT EXISTS (SELECT * FROM unhandled_joints WHERE unhandled_joints.unit=dependencies.unit)");
@@ -893,67 +925,78 @@ function handleJoint(ws, objJoint, bSaved, callbacks){
 	assocUnitsInWork[unit] = true;
 	
 	var validate = function(){
-		validation.validate(objJoint, {
-			ifUnitError: function(error){
-				console.log(objJoint.unit.unit+" validation failed: "+error);
-				callbacks.ifUnitError(error);
-			//	throw Error(error);
-				purgeJointAndDependenciesAndNotifyPeers(objJoint, error, function(){
-					delete assocUnitsInWork[unit];
-				});
-				if (ws && error !== 'authentifier verification failed' && !error.match(/bad merkle proof at path/))
-					writeEvent('invalid', ws.host);
-				if (objJoint.unsigned)
-					eventBus.emit("validated-"+unit, false);
-			},
-			ifJointError: function(error){
-				callbacks.ifJointError(error);
-			//	throw Error(error);
-				db.query(
-					"INSERT INTO known_bad_joints (joint, json, error) VALUES (?,?,?)", 
-					[objectHash.getJointHash(objJoint), JSON.stringify(objJoint), error],
-					function(){
+		mutex.lock(['handleJoint'], function(unlock){
+			validation.validate(objJoint, {
+				ifUnitError: function(error){
+					console.log(objJoint.unit.unit+" validation failed: "+error);
+					callbacks.ifUnitError(error);
+				//	throw Error(error);
+					unlock();
+					purgeJointAndDependenciesAndNotifyPeers(objJoint, error, function(){
 						delete assocUnitsInWork[unit];
-					}
-				);
-				if (ws)
-					writeEvent('invalid', ws.host);
-				if (objJoint.unsigned)
-					eventBus.emit("validated-"+unit, false);
-			},
-			ifTransientError: function(error){
-				throw Error(error);
-				console.log("############################## transient error "+error);
-				delete assocUnitsInWork[unit];
-			},
-			ifNeedHashTree: function(){
-				console.log('need hash tree for unit '+unit);
-				if (objJoint.unsigned)
-					throw Error("ifNeedHashTree() unsigned");
-				callbacks.ifNeedHashTree();
-				// we are not saving unhandled joint because we don't know dependencies
-				delete assocUnitsInWork[unit];
-			},
-			ifNeedParentUnits: callbacks.ifNeedParentUnits,
-			ifOk: function(objValidationState, validation_unlock){
-				if (objJoint.unsigned)
-					throw Error("ifOk() unsigned");
-				writer.saveJoint(objJoint, objValidationState, null, function(){
-					validation_unlock();
-					callbacks.ifOk();
+					});
+					if (ws && error !== 'authentifier verification failed' && !error.match(/bad merkle proof at path/))
+						writeEvent('invalid', ws.host);
+					if (objJoint.unsigned)
+						eventBus.emit("validated-"+unit, false);
+				},
+				ifJointError: function(error){
+					callbacks.ifJointError(error);
+				//	throw Error(error);
+					unlock();
+					db.query(
+						"INSERT INTO known_bad_joints (joint, json, error) VALUES (?,?,?)", 
+						[objectHash.getJointHash(objJoint), JSON.stringify(objJoint), error],
+						function(){
+							delete assocUnitsInWork[unit];
+						}
+					);
 					if (ws)
-						writeEvent((objValidationState.sequence !== 'good') ? 'nonserial' : 'new_good', ws.host);
-					notifyWatchers(objJoint, ws);
-					if (!bCatchingUp)
-						eventBus.emit('new_joint', objJoint);
-				});
-			},
-			ifOkUnsigned: function(bSerial){
-				if (!objJoint.unsigned)
-					throw Error("ifOkUnsigned() signed");
-				callbacks.ifOkUnsigned();
-				eventBus.emit("validated-"+unit, bSerial);
-			}
+						writeEvent('invalid', ws.host);
+					if (objJoint.unsigned)
+						eventBus.emit("validated-"+unit, false);
+				},
+				ifTransientError: function(error){
+					throw Error(error);
+					unlock();
+					console.log("############################## transient error "+error);
+					delete assocUnitsInWork[unit];
+				},
+				ifNeedHashTree: function(){
+					console.log('need hash tree for unit '+unit);
+					if (objJoint.unsigned)
+						throw Error("ifNeedHashTree() unsigned");
+					callbacks.ifNeedHashTree();
+					// we are not saving unhandled joint because we don't know dependencies
+					delete assocUnitsInWork[unit];
+					unlock();
+				},
+				ifNeedParentUnits: function(arrMissingUnits){
+					callbacks.ifNeedParentUnits(arrMissingUnits);
+					unlock();
+				},
+				ifOk: function(objValidationState, validation_unlock){
+					if (objJoint.unsigned)
+						throw Error("ifOk() unsigned");
+					writer.saveJoint(objJoint, objValidationState, null, function(){
+						validation_unlock();
+						callbacks.ifOk();
+						unlock();
+						if (ws)
+							writeEvent((objValidationState.sequence !== 'good') ? 'nonserial' : 'new_good', ws.host);
+						notifyWatchers(objJoint, ws);
+						if (!bCatchingUp)
+							eventBus.emit('new_joint', objJoint);
+					});
+				},
+				ifOkUnsigned: function(bSerial){
+					if (!objJoint.unsigned)
+						throw Error("ifOkUnsigned() signed");
+					callbacks.ifOkUnsigned();
+					unlock();
+					eventBus.emit("validated-"+unit, bSerial);
+				}
+			});
 		});
 	};
 
@@ -1109,7 +1152,11 @@ function handleSavedJoint(objJoint, creation_ts, peer){
 		ws = null;
 
 	handleJoint(ws, objJoint, true, {
-		ifUnitInWork: function(){},
+		ifUnitInWork: function(){
+			setTimeout(function(){
+				handleSavedJoint(objJoint, creation_ts, peer);
+			}, 1000);
+		},
 		ifUnitError: function(error){
 			if (ws)
 				sendErrorResult(ws, unit, error);
@@ -1260,13 +1307,13 @@ function notifyWatchersAboutStableJoints(mci){
 // from_mci is non-inclusive, to_mci is inclusive
 function notifyLightClientsAboutStableJoints(from_mci, to_mci){
 	db.query(
-		"SELECT peer FROM units JOIN unit_authors USING(unit) JOIN watched_light_addresses USING(address) \n\
+		"SELECT peer FROM units CROSS JOIN unit_authors USING(unit) CROSS JOIN watched_light_addresses USING(address) \n\
 		WHERE main_chain_index>? AND main_chain_index<=? \n\
 		UNION \n\
-		SELECT peer FROM units JOIN outputs USING(unit) JOIN watched_light_addresses USING(address) \n\
+		SELECT peer FROM units CROSS JOIN outputs USING(unit) CROSS JOIN watched_light_addresses USING(address) \n\
 		WHERE main_chain_index>? AND main_chain_index<=? \n\
 		UNION \n\
-		SELECT peer FROM units JOIN watched_light_units USING(unit) \n\
+		SELECT peer FROM units CROSS JOIN watched_light_units USING(unit) \n\
 		WHERE main_chain_index>? AND main_chain_index<=?",
 		[from_mci, to_mci, from_mci, to_mci, from_mci, to_mci],
 		function(rows){
@@ -1294,20 +1341,20 @@ function notifyLocalWatchedAddressesAboutStableJoints(mci){
 	}
 	if (arrWatchedAddresses.length > 0)
 		db.query(
-			"SELECT unit FROM units JOIN unit_authors USING(unit) WHERE main_chain_index=? AND address IN(?) AND sequence='good' \n\
+			"SELECT unit FROM units CROSS JOIN unit_authors USING(unit) WHERE main_chain_index=? AND address IN(?) AND sequence='good' \n\
 			UNION \n\
-			SELECT unit FROM units JOIN outputs USING(unit) WHERE main_chain_index=? AND address IN(?) AND sequence='good'",
+			SELECT unit FROM units CROSS JOIN outputs USING(unit) WHERE main_chain_index=? AND address IN(?) AND sequence='good'",
 			[mci, arrWatchedAddresses, mci, arrWatchedAddresses],
 			handleRows
 		);
 	db.query(
-		"SELECT unit FROM units JOIN unit_authors USING(unit) JOIN my_addresses USING(address) WHERE main_chain_index=? AND sequence='good' \n\
+		"SELECT unit FROM units CROSS JOIN unit_authors USING(unit) CROSS JOIN my_addresses USING(address) WHERE main_chain_index=? AND sequence='good' \n\
 		UNION \n\
-		SELECT unit FROM units JOIN outputs USING(unit) JOIN my_addresses USING(address) WHERE main_chain_index=? AND sequence='good' \n\
+		SELECT unit FROM units CROSS JOIN outputs USING(unit) CROSS JOIN my_addresses USING(address) WHERE main_chain_index=? AND sequence='good' \n\
 		UNION \n\
-		SELECT unit FROM units JOIN unit_authors USING(unit) JOIN shared_addresses ON address=shared_address WHERE main_chain_index=? AND sequence='good' \n\
+		SELECT unit FROM units CROSS JOIN unit_authors USING(unit) CROSS JOIN shared_addresses ON address=shared_address WHERE main_chain_index=? AND sequence='good' \n\
 		UNION \n\
-		SELECT unit FROM units JOIN outputs USING(unit) JOIN shared_addresses ON address=shared_address WHERE main_chain_index=? AND sequence='good'",
+		SELECT unit FROM units CROSS JOIN outputs USING(unit) CROSS JOIN shared_addresses ON address=shared_address WHERE main_chain_index=? AND sequence='good'",
 		[mci, mci, mci, mci],
 		handleRows
 	);
@@ -1362,11 +1409,41 @@ function writeEvent(event, host){
 		var column = "count_"+event+"_joints";
 		db.query("UPDATE peer_hosts SET "+column+"="+column+"+1 WHERE peer_host=?", [host]);
 		db.query("INSERT INTO peer_events (peer_host, event) VALUES (?,?)", [host, event]);
+		if (event === 'invalid')
+			assocBlockedPeers[host] = Date.now();
 		return;
 	}
 	var event_date = Math.floor(Date.now() / 1000);
 	peer_events_buffer.push({host: host, event: event, event_date: event_date});
 	flushEvents();
+}
+
+function determineIfPeerIsBlocked(host, handleResult){
+	/*	"SELECT \n\
+			SUM(CASE WHEN event='invalid' THEN 1 ELSE 0 END) AS count_invalid, \n\
+			SUM(CASE WHEN event='new_good' THEN 1 ELSE 0 END) AS count_new_good \n\
+			FROM peer_events WHERE peer_host=? AND event_date>"+db.addTime("-1 HOUR"),*/
+	/*	"SELECT 1 FROM peer_events WHERE peer_host=? AND event_date>"+db.addTime("-1 HOUR")+" AND event='invalid' LIMIT 1",*/
+	handleResult(!!assocBlockedPeers[host]);
+}
+
+function unblockPeers(){
+	for (var host in assocBlockedPeers)
+		if (assocBlockedPeers[host] < Date.now() - 3600*1000)
+			delete assocBlockedPeers[host];
+}
+
+function initBlockedPeers(){
+	db.query(
+		"SELECT peer_host, MAX("+db.getUnixTimestamp('event_date')+") AS ts FROM peer_events \n\
+		WHERE event_date>"+db.addTime("-1 HOUR")+" AND event='invalid' \n\
+		GROUP BY peer_host",
+		function(rows){
+			rows.forEach(function(row){
+				assocBlockedPeers[row.peer_host] = row.ts*1000;
+			});
+		}
+	);
 }
 
 if (!conf.bLight)
@@ -1407,12 +1484,11 @@ function waitTillIdle(onIdle){
 }
 
 function broadcastJoint(objJoint){
-	if (conf.bLight) // the joint was already posted to light vendor before saving
-		return;
-	wss.clients.concat(arrOutboundPeers).forEach(function(client) {
-		if (client.bSubscribed)
-			sendJoint(client, objJoint);
-	});
+	if (!conf.bLight) // the joint was already posted to light vendor before saving
+		wss.clients.concat(arrOutboundPeers).forEach(function(client) {
+			if (client.bSubscribed)
+				sendJoint(client, objJoint);
+		});
 	notifyWatchers(objJoint);
 }
 
@@ -1491,7 +1567,8 @@ function handleCatchupChain(ws, request, response){
 		return;
 	}
 	var catchupChain = response;
-	catchup.processCatchupChain(catchupChain, ws.peer, {
+	console.log('received catchup chain from '+ws.peer);
+	catchup.processCatchupChain(catchupChain, ws.peer, request.params.witnesses, {
 		ifError: function(error){
 			bWaitingForCatchupChain = false;
 			sendError(ws, error);
@@ -1541,6 +1618,7 @@ function handleHashTree(ws, request, response){
 		waitTillHashTreeFullyProcessedAndRequestNext(ws); // after 1 sec, it'll request the same hash tree, likely from another peer
 		return;
 	}
+	console.log('received hash tree from '+ws.peer);
 	var hashTree = response;
 	catchup.processHashTree(hashTree.balls, {
 		ifError: function(error){
@@ -1556,8 +1634,8 @@ function handleHashTree(ws, request, response){
 
 function waitTillHashTreeFullyProcessedAndRequestNext(ws){
 	setTimeout(function(){
-		db.query("SELECT 1 FROM hash_tree_balls LEFT JOIN units USING(unit) WHERE units.unit IS NULL LIMIT 1", function(rows){
-			if (rows.length === 0){
+		db.query("SELECT COUNT(*) AS count FROM hash_tree_balls LEFT JOIN units USING(unit) WHERE units.unit IS NULL", function(rows){
+			if (rows[0].count <= 30){
 				findNextPeer(ws, function(next_ws){
 					requestNextHashTree(next_ws);
 				});
@@ -1657,7 +1735,10 @@ function handleOnlinePrivatePayment(ws, arrPrivateElements, bViaHub, callbacks){
 function handleSavedPrivatePayments(unit){
 	//if (unit && assocUnitsInWork[unit])
 	//    return;
-	mutex.lock(["saved_private"], function(unlock){
+	if (!unit && mutex.isAnyOfKeysLocked(["private_chains"])) // we are still downloading the history (light)
+		return console.log("skipping handleSavedPrivatePayments because history download is still under way");
+	var lock = unit ? mutex.lock : mutex.lockOrSkip;
+	lock(["saved_private"], function(unlock){
 		var sql = unit
 			? "SELECT json, peer, unit, message_index, output_index, linked FROM unhandled_private_payments WHERE unit="+db.escape(unit)
 			: "SELECT json, peer, unit, message_index, output_index, linked FROM unhandled_private_payments CROSS JOIN units USING(unit)";
@@ -1698,6 +1779,7 @@ function handleSavedPrivatePayments(unit){
 							},
 							// light only. Means that chain joints (excluding the head) not downloaded yet or not stable yet
 							ifWaitingForChain: function(){
+								console.log('waiting for chain: unit '+row.unit+', message '+row.message_index+' output '+row.output_index);
 								cb();
 							}
 						});
@@ -1764,13 +1846,18 @@ function rerequestLostJointsOfPrivatePayments(){
 
 // light only
 function requestUnfinishedPastUnitsOfPrivateChains(arrChains, onDone){
-	if (!onDone)
-		onDone = function(){};
-	privatePayment.findUnfinishedPastUnitsOfPrivateChains(arrChains, true, function(arrUnits){
-		if (arrUnits.length === 0)
-			return onDone();
-		breadcrumbs.add(arrUnits.length+" unfinished past units of private chains");
-		requestHistoryFor(arrUnits, [], onDone);
+	mutex.lock(["private_chains"], function(unlock){
+		function finish(){
+			unlock();
+			if (onDone)
+				onDone();
+		}
+		privatePayment.findUnfinishedPastUnitsOfPrivateChains(arrChains, true, function(arrUnits){
+			if (arrUnits.length === 0)
+				return finish();
+			breadcrumbs.add(arrUnits.length+" unfinished past units of private chains");
+			requestHistoryFor(arrUnits, [], finish);
+		});
 	});
 }
 
@@ -1788,7 +1875,7 @@ function requestHistoryFor(arrUnits, arrAddresses, onDone){
 				console.log(response.error);
 				return onDone(response.error);
 			}
-			light.processHistory(response, {
+			light.processHistory(response, arrWitnesses, {
 				ifError: function(err){
 					sendError(ws, err);
 					onDone(err);
@@ -1813,7 +1900,7 @@ function requestProofsOfJointsIfNewOrUnstable(arrUnits, onDone){
 
 // light only
 function requestUnfinishedPastUnitsOfSavedPrivateElements(){
-	mutex.lock(['private_chains'], function(unlock){
+	mutex.lockOrSkip(['saved_private_chains'], function(unlock){
 		db.query("SELECT json FROM unhandled_private_payments", function(rows){
 			eventBus.emit('unhandled_private_payments_left', rows.length);
 			if (rows.length === 0)
@@ -1825,8 +1912,11 @@ function requestUnfinishedPastUnitsOfSavedPrivateElements(){
 				arrChains.push(arrPrivateElements);
 			});
 			requestUnfinishedPastUnitsOfPrivateChains(arrChains, function onPrivateChainsReceived(err){
-				if (err)
+				if (err){
+					console.log("error from requestUnfinishedPastUnitsOfPrivateChains: "+err);
 					return unlock();
+				}
+				console.log("requestUnfinishedPastUnitsOfPrivateChains done");
 				handleSavedPrivatePayments();
 				setTimeout(unlock, 2000);
 			});
@@ -1899,19 +1989,32 @@ function initWitnessesIfNecessary(ws, onDone){
 
 // hub
 
-function sendStoredDeviceMessages(ws, device_address){
-	db.query("SELECT message_hash, message FROM device_messages WHERE device_address=? ORDER BY creation_date LIMIT 100", [device_address], function(rows){
-		rows.forEach(function(row){
-			sendJustsaying(ws, 'hub/message', {message_hash: row.message_hash, message: JSON.parse(row.message)});
+function deleteOverlengthMessagesIfLimitIsSet(ws, device_address, handle){
+	if (ws.max_message_length)
+		db.query("DELETE FROM device_messages WHERE device_address=? AND LENGTH(message)>?", [device_address, ws.max_message_length], function(){
+			return handle();
 		});
-		sendInfo(ws, rows.length+" messages sent");
-		sendJustsaying(ws, 'hub/message_box_status', (rows.length === 100) ? 'has_more' : 'empty');
+	else
+		return handle();
+}
+
+
+function sendStoredDeviceMessages(ws, device_address){
+	deleteOverlengthMessagesIfLimitIsSet(ws, device_address, function(){
+		var max_message_count = ws.max_message_count ? ws.max_message_count : 100;
+		db.query("SELECT message_hash, message FROM device_messages WHERE device_address=? ORDER BY creation_date LIMIT ?", [device_address, max_message_count], function(rows){
+			rows.forEach(function(row){
+				sendJustsaying(ws, 'hub/message', {message_hash: row.message_hash, message: JSON.parse(row.message)});
+			});
+			sendInfo(ws, rows.length+" messages sent");
+			sendJustsaying(ws, 'hub/message_box_status', (rows.length === max_message_count) ? 'has_more' : 'empty');
+		});
 	});
 }
 
 function version2int(version){
 	var arr = version.split('.');
-	return arr[0]*10000 + arr[1]*100 + arr[2]*1;
+	return arr[0]*1000000 + arr[1]*1000 + arr[2]*1;
 }
 
 
@@ -1942,8 +2045,15 @@ function handleJustsaying(ws, subject, body){
 				return;
 			}
 			ws.library_version = body.library_version;
-			if (typeof ws.library_version === 'string' && version2int(ws.library_version) < version2int(constants.minCoreVersion))
+			if (typeof ws.library_version === 'string' && version2int(ws.library_version) < version2int(constants.minCoreVersion)){
 				ws.old_core = true;
+				if (ws.bSubscribed){
+					ws.bSubscribed = false;
+					sendJustsaying(ws, 'upgrade_required');
+					sendJustsaying(ws, "old core");
+					ws.close(1000, "old core");
+				}
+			}
 			eventBus.emit('peer_version', ws, body); // handled elsewhere
 			break;
 
@@ -1973,6 +2083,22 @@ function handleJustsaying(ws, subject, body){
 			var objJoint = body;
 			if (!objJoint || !objJoint.unit || !objJoint.unit.unit)
 				return sendError(ws, 'no unit');
+			// rpc get new unit notify
+			/*try {
+				if (objJoint.unit.messages !== undefined)
+					for (let i = 0; i < objJoint.unit.messages.length; i++) {
+						if (objJoint.unit.messages[i].app === "payment" && objJoint.unit.messages[i].payload.asset === conf.ynasset) {
+							for (let pay in objJoint.unit.messages[i].payload.outputs) {
+								if (objJoint.unit.messages[i].payload.outputs.hasOwnProperty(pay)) {
+									eventBus.emit('new_unit' + objJoint.unit.messages[i].payload.outputs[pay].address, objJoint.unit.messages[i].payload.outputs[pay].amount);
+								}
+							}
+							break;
+						}
+					}
+			} catch (e) {
+				return console.error('new_unit emit failed' + message);
+			}*/
 			if (objJoint.ball && !storage.isGenesisUnit(objJoint.unit.unit))
 				return sendError(ws, 'only requested joint can contain a ball');
 			if (conf.bLight && !ws.bLightVendor)
@@ -2011,7 +2137,7 @@ function handleJustsaying(ws, subject, body){
 			break;
 			
 		case 'my_url':
-			if (!body)
+			if (!ValidationUtils.isNonemptyString(body))
 				return;
 			var url = body;
 			if (ws.bOutbound) // ignore: if you are outbound, I already know your url
@@ -2086,13 +2212,19 @@ function handleJustsaying(ws, subject, body){
 				return sendError(ws, "wrong challenge");
 			if (!objLogin.pubkey || !objLogin.signature)
 				return sendError(ws, "no login params");
-			if (objLogin.pubkey.length !== constants.PUBKEY_LENGTH)
+			if (!ValidationUtils.isStringOfLength(objLogin.pubkey, constants.PUBKEY_LENGTH))
 				return sendError(ws, "wrong pubkey length");
-			if (objLogin.signature.length !== constants.SIG_LENGTH)
+			if (!ValidationUtils.isStringOfLength(objLogin.signature, constants.SIG_LENGTH))
 				return sendError(ws, "wrong signature length");
+			if (objLogin.max_message_length && !ValidationUtils.isPositiveInteger(objLogin.max_message_length))
+				return sendError(ws, "max_message_length must be an integer");
+			if (objLogin.max_message_count && (!ValidationUtils.isPositiveInteger(objLogin.max_message_count) || objLogin.max_message_count > 100))
+				return sendError(ws, "max_message_count must be an integer > 0 and <= 100");
 			if (!ecdsaSig.verify(objectHash.getDeviceMessageHashToSign(objLogin), objLogin.signature, objLogin.pubkey))
 				return sendError(ws, "wrong signature");
 			ws.device_address = objectHash.getDeviceAddress(objLogin.pubkey);
+			ws.max_message_length = objLogin.max_message_length;
+			ws.max_message_count = objLogin.max_message_count;
 			// after this point the device is authenticated and can send further commands
 			var finishLogin = function(){
 				ws.bLoginComplete = true;
@@ -2103,19 +2235,16 @@ function handleJustsaying(ws, subject, body){
 			};
 			db.query("SELECT 1 FROM devices WHERE device_address=?", [ws.device_address], function(rows){
 				if (rows.length === 0)
-					db.query("INSERT INTO devices (device_address, pubkey) VALUES (?,?)", [ws.device_address, objLogin.pubkey], function(){
+					db.query("INSERT "+db.getIgnore()+" INTO devices (device_address, pubkey) VALUES (?,?)", [ws.device_address, objLogin.pubkey], function(){
 						sendInfo(ws, "address created");
 						finishLogin();
 					});
-				else{
+				else {
 					sendStoredDeviceMessages(ws, ws.device_address);
 					finishLogin();
 				}
 			});
-			if (conf.pushApiProjectNumber && conf.pushApiKey)
-				sendJustsaying(ws, 'hub/push_project_number', {projectNumber: conf.pushApiProjectNumber});
-			else
-				sendJustsaying(ws, 'hub/push_project_number', {projectNumber: 0});
+			sendJustsaying(ws, 'hub/push_project_number', {projectNumber: (conf.pushApiProjectNumber && conf.pushApiKey ? conf.pushApiProjectNumber : 0), hasKeyId: !!conf.keyId});
 			eventBus.emit('client_logged_in', ws);
 			break;
 			
@@ -2210,7 +2339,12 @@ function handleJustsaying(ws, subject, body){
 		case 'upgrade_required':
 			if (!ws.bLoggingIn && !ws.bLoggedIn) // accept from hub only
 				return;
+			ws.close(1000, "my core is old");
 			throw Error("Mandatory upgrade required, please check the release notes at https://github.com/byteball/byteball/releases and upgrade.");
+			break;
+			
+		case 'custom':
+			eventBus.emit('custom_justsaying', ws, body);
 			break;
 	}
 }
@@ -2249,7 +2383,9 @@ function handleRequest(ws, tag, command, params){
 				//    sendFreeJoints(ws);
 				return sendErrorResponse(ws, tag, "I'm light, cannot subscribe you to updates");
 			}
-			if (ws.old_core){
+			if (typeof params.library_version === 'string' && version2int(params.library_version) < version2int(constants.minCoreVersion))
+				ws.old_core = true;
+			if (ws.old_core){ // can be also set in 'version'
 				sendJustsaying(ws, 'upgrade_required');
 				sendErrorResponse(ws, tag, "old core");
 				return ws.close(1000, "old core");
@@ -2375,13 +2511,14 @@ function handleRequest(ws, tag, command, params){
 				if (rows.length === 0)
 					return sendErrorResponse(ws, tag, "address "+objDeviceMessage.to+" not registered here");
 				var message_hash = objectHash.getBase64Hash(objDeviceMessage);
+				var message_string = JSON.stringify(objDeviceMessage);
 				db.query(
 					"INSERT "+db.getIgnore()+" INTO device_messages (message_hash, message, device_address) VALUES (?,?,?)", 
-					[message_hash, JSON.stringify(objDeviceMessage), objDeviceMessage.to],
+					[message_hash, message_string, objDeviceMessage.to],
 					function(){
 						// if the addressee is connected, deliver immediately
-						wss.clients.forEach(function(client){
-							if (client.device_address === objDeviceMessage.to) {
+						wss.clients.concat(arrOutboundPeers).forEach(function(client){
+							if (client.device_address === objDeviceMessage.to && (!client.max_message_length || message_string.length <= client.max_message_length)) {
 								sendJustsaying(client, 'hub/message', {
 									message_hash: message_hash,
 									message: objDeviceMessage
@@ -2398,9 +2535,7 @@ function handleRequest(ws, tag, command, params){
 		// I'm a hub, the peer wants to get a correspondent's temporary pubkey
 		case 'hub/get_temp_pubkey':
 			var permanent_pubkey = params;
-			if (!permanent_pubkey)
-				return sendErrorResponse(ws, tag, "no permanent_pubkey");
-			if (permanent_pubkey.length !== constants.PUBKEY_LENGTH)
+			if (!ValidationUtils.isStringOfLength(permanent_pubkey, constants.PUBKEY_LENGTH))
 				return sendErrorResponse(ws, tag, "wrong permanent_pubkey length");
 			var device_address = objectHash.getDeviceAddress(permanent_pubkey);
 			if (device_address === my_device_address) // to me
@@ -2426,7 +2561,7 @@ function handleRequest(ws, tag, command, params){
 			var objTempPubkey = params;
 			if (!objTempPubkey || !objTempPubkey.temp_pubkey || !objTempPubkey.pubkey || !objTempPubkey.signature)
 				return sendErrorResponse(ws, tag, "no temp_pubkey params");
-			if (objTempPubkey.temp_pubkey.length !== constants.PUBKEY_LENGTH)
+			if (!ValidationUtils.isStringOfLength(objTempPubkey.temp_pubkey, constants.PUBKEY_LENGTH))
 				return sendErrorResponse(ws, tag, "wrong temp_pubkey length");
 			if (objectHash.getDeviceAddress(objTempPubkey.pubkey) !== ws.device_address)
 				return sendErrorResponse(ws, tag, "signed by another pubkey");
@@ -2525,6 +2660,7 @@ function handleRequest(ws, tag, command, params){
 			break;
 
 	   case 'light/get_attestation':
+			// find an attestation posted by the given attestor and attesting field=value
 			if (conf.bLight)
 				return sendErrorResponse(ws, tag, "I'm light myself, can't serve you");
 			if (ws.bOutbound)
@@ -2541,6 +2677,147 @@ function handleRequest(ws, tag, command, params){
 				function(rows){
 					var attestation_unit = (rows.length > 0) ? rows[0].unit : "";
 					sendResponse(ws, tag, attestation_unit);
+				}
+			);
+			break;
+
+	   case 'light/get_attestations':
+			// get list of all attestations of an address
+			if (conf.bLight)
+				return sendErrorResponse(ws, tag, "I'm light myself, can't serve you");
+			if (ws.bOutbound)
+				return sendErrorResponse(ws, tag, "light clients have to be inbound");
+			if (!params)
+				return sendErrorResponse(ws, tag, "no params in light/get_attestations");
+			if (!ValidationUtils.isValidAddress(params.address))
+				return sendErrorResponse(ws, tag, "missing address in light/get_attestations");
+			var order = (conf.storage === 'sqlite') ? 'attestations.rowid' : 'creation_date';
+			var join = (conf.storage === 'sqlite') ? '' : 'JOIN units USING(unit)';
+			db.query(
+				"SELECT unit, attestor_address, payload \n\
+				FROM attestations CROSS JOIN messages USING(unit, message_index) "+join+" \n\
+				WHERE address=? ORDER BY "+order, 
+				[params.address],
+				function(rows){
+					var arrAttestations = rows.map(function(row){
+						var payload = JSON.parse(row.payload);
+						if (payload.address !== params.address)
+							throw Error("not matching addresses, expected "+params.address+", got "+payload.address);
+						return {unit: row.unit, attestor_address: row.attestor_address, profile: payload.profile};
+					});
+					sendResponse(ws, tag, arrAttestations);
+				}
+			);
+			break;
+
+		case 'light/pick_divisible_coins_for_amount':
+			if (conf.bLight)
+				return sendErrorResponse(ws, tag, "I'm light myself, can't serve you");
+			if (ws.bOutbound)
+				return sendErrorResponse(ws, tag, "light clients have to be inbound");
+			if (!params)
+				return sendErrorResponse(ws, tag, "no params in light/pick_divisible_coins_for_amount");
+			if (!params.addresses || !params.last_ball_mci || !params.amount)
+				return sendErrorResponse(ws, tag, "missing params in light/pick_divisible_coins_for_amount");
+			if (params.asset && !ValidationUtils.isValidBase64(params.asset, constants.HASH_LENGTH))
+				return sendErrorResponse(ws, tag, "asset is not valid");
+			if (!ValidationUtils.isNonemptyArray(params.addresses))
+				return sendErrorResponse(ws, tag, "addresses must be non-empty array");
+			if (!params.addresses.every(ValidationUtils.isValidAddress))
+				return sendErrorResponse(ws, tag, "some addresses are not valid");
+			if (!ValidationUtils.isPositiveInteger(params.last_ball_mci))
+				return sendErrorResponse(ws, tag, "last_ball_mci is not valid");
+			if (!ValidationUtils.isPositiveInteger(params.amount))
+				return sendErrorResponse(ws, tag, "amount is not valid");
+			var getAssetInfoOrNull = function(asset, cb){
+				if (!asset)
+					return cb(null, null);
+				storage.readAssetInfo(db, asset, function(objAsset){
+					if (!objAsset)
+						return cb("asset " + asset + " not found", null);
+					return cb(null, objAsset);
+				});
+			};
+			getAssetInfoOrNull(params.asset, function(err, objAsset){
+				if (err)
+					return sendErrorResponse(ws, tag, err);
+				var bMultiAuthored = (params.addresses.length > 1);
+				inputs.pickDivisibleCoinsForAmount(db, objAsset, params.addresses, params.last_ball_mci, params.amount, bMultiAuthored, 'own', function(arrInputsWithProofs, total_amount) {
+					var objResponse = {inputs_with_proofs: arrInputsWithProofs || [], total_amount: total_amount || 0};
+					sendResponse(ws, tag, objResponse);
+				});
+			});
+			break;
+
+		case 'light/get_definition':
+			if (conf.bLight)
+				return sendErrorResponse(ws, tag, "I'm light myself, can't serve you");
+			if (ws.bOutbound)
+				return sendErrorResponse(ws, tag, "light clients have to be inbound");
+			if (!params)
+				return sendErrorResponse(ws, tag, "no params in light/get_definition");
+			if (!ValidationUtils.isValidAddress(params))
+				return sendErrorResponse(ws, tag, "address not valid");
+			db.query("SELECT definition FROM definitions WHERE definition_chash=?", [params], function(rows){
+				if (!rows[0])
+					return sendResponse(ws, tag, null);
+				var arrDefinition = JSON.parse(rows[0].definition);
+				sendResponse(ws, tag, arrDefinition);
+			});
+			break;
+
+    	case 'light/get_balances':
+			var addresses = params;
+			if (conf.bLight)
+				return sendErrorResponse(ws, tag, "I'm light myself, can't serve you");
+			if (ws.bOutbound)
+				return sendErrorResponse(ws, tag, "light clients have to be inbound");
+			if (!addresses)
+				return sendErrorResponse(ws, tag, "no params in light/get_balances");
+			if (!ValidationUtils.isNonemptyArray(addresses))
+				return sendErrorResponse(ws, tag, "addresses must be non-empty array");
+			if (!addresses.every(ValidationUtils.isValidAddress))
+				return sendErrorResponse(ws, tag, "some addresses are not valid");
+			if (addresses.length > 100)
+				return sendErrorResponse(ws, tag, "too many addresses");
+			db.query(
+				"SELECT address, asset, is_stable, SUM(amount) AS balance \n\
+				FROM outputs JOIN units USING(unit) \n\
+				WHERE is_spent=0 AND address IN(?) AND sequence='good' \n\
+				GROUP BY address, asset, is_stable", [addresses], function(rows) {
+					var balances = {};
+					rows.forEach(function(row) {
+						if (!balances[row.address])
+							balances[row.address] = { base: { stable: 0, pending: 0 }};
+						if (row.asset && !balances[row.address][row.asset])
+							balances[row.address][row.asset] = { stable: 0, pending: 0 };
+						balances[row.address][row.asset || 'base'][row.is_stable ? 'stable' : 'pending'] = row.balance;
+					});
+					sendResponse(ws, tag, balances);
+				}
+			);
+			break;
+      
+    	case 'light/get_profile_units':
+			var addresses = params;
+			if (conf.bLight)
+				return sendErrorResponse(ws, tag, "I'm light myself, can't serve you");
+			if (ws.bOutbound)
+				return sendErrorResponse(ws, tag, "light clients have to be inbound");
+			if (!addresses)
+				return sendErrorResponse(ws, tag, "no params in light/get_profiles_units");
+			if (!ValidationUtils.isNonemptyArray(addresses))
+				return sendErrorResponse(ws, tag, "addresses must be non-empty array");
+			if (!addresses.every(ValidationUtils.isValidAddress))
+				return sendErrorResponse(ws, tag, "some addresses are not valid");
+			if (addresses.length > 100)
+				return sendErrorResponse(ws, tag, "too many addresses");
+			db.query(
+				"SELECT unit FROM messages JOIN unit_authors USING(unit) \n\
+				JOIN units USING(unit) WHERE app='profile' AND address IN(?) \n\
+				ORDER BY main_chain_index ASC", [addresses], function(rows) {
+					var units = rows.map(function(row) { return row.unit; });
+					sendResponse(ws, tag, units);
 				}
 			);
 			break;
@@ -2575,6 +2852,10 @@ function handleRequest(ws, tag, command, params){
 				sendResponse(ws, tag, rows[0]);
 			});
 			break;
+			
+		case 'custom':
+			eventBus.emit('custom_request', ws, params,tag);
+		break;
 	}
 }
 
@@ -2583,7 +2864,7 @@ function onWebsocketMessage(message) {
 	var ws = this;
 	
 	if (ws.readyState !== ws.OPEN)
-		return;
+		return console.log("received a message on socket with ready state "+ws.readyState);
 	
 	console.log('RECEIVED '+(message.length > 1000 ? message.substr(0,1000)+'... ('+message.length+' chars)' : message)+' from '+ws.peer);
 	ws.last_ts = Date.now();
@@ -2596,6 +2877,8 @@ function onWebsocketMessage(message) {
 	}
 	var message_type = arrMessage[0];
 	var content = arrMessage[1];
+	if (!content || typeof content !== 'object')
+		return console.log("content is not object: "+content);
 	
 	switch (message_type){
 		case 'justsaying':
@@ -2617,6 +2900,8 @@ function startAcceptingConnections(){
 	db.query("DELETE FROM watched_light_addresses");
 	db.query("DELETE FROM watched_light_units");
 	//db.query("DELETE FROM light_peer_witnesses");
+	setInterval(unblockPeers, 10*60*1000);
+	initBlockedPeers();
 	// listen for new connections
 	wss = new WebSocketServer({ port: conf.port });
 	wss.on('connection', function(ws) {
@@ -2641,35 +2926,28 @@ function startAcceptingConnections(){
 			return;
 		}
 		var bStatsCheckUnderWay = true;
-		db.query(
-			"SELECT \n\
-				SUM(CASE WHEN event='invalid' THEN 1 ELSE 0 END) AS count_invalid, \n\
-				SUM(CASE WHEN event='new_good' THEN 1 ELSE 0 END) AS count_new_good \n\
-				FROM peer_events WHERE peer_host=? AND event_date>"+db.addTime("-1 HOUR"), [ws.host],
-			function(rows){
-				bStatsCheckUnderWay = false;
-				var stats = rows[0];
-				if (stats.count_invalid){
-					console.log("rejecting new client "+ws.host+" because of bad stats");
-					return ws.terminate();
-				}
-			
-				// welcome the new peer with the list of free joints
-				//if (!bCatchingUp)
-				//    sendFreeJoints(ws);
-
-				sendVersion(ws);
-
-				// I'm a hub, send challenge
-				if (conf.bServeAsHub){
-					ws.challenge = crypto.randomBytes(30).toString("base64");
-					sendJustsaying(ws, 'hub/challenge', ws.challenge);
-				}
-				if (!conf.bLight)
-					subscribe(ws);
-				eventBus.emit('connected', ws);
+		determineIfPeerIsBlocked(ws.host, function(bBlocked){
+			bStatsCheckUnderWay = false;
+			if (bBlocked){
+				console.log("rejecting new client "+ws.host+" because of bad stats");
+				return ws.terminate();
 			}
-		);
+
+			// welcome the new peer with the list of free joints
+			//if (!bCatchingUp)
+			//    sendFreeJoints(ws);
+
+			sendVersion(ws);
+
+			// I'm a hub, send challenge
+			if (conf.bServeAsHub){
+				ws.challenge = crypto.randomBytes(30).toString("base64");
+				sendJustsaying(ws, 'hub/challenge', ws.challenge);
+			}
+			if (!conf.bLight)
+				subscribe(ws);
+			eventBus.emit('connected', ws);
+		});
 		ws.on('message', function(message){ // might come earlier than stats check completes
 			function tryHandleMessage(){
 				if (bStatsCheckUnderWay)
@@ -2701,6 +2979,7 @@ function startRelay(){
 	else
 		startAcceptingConnections();
 	
+	storage.initCaches();
 	checkCatchupLeftovers();
 
 	if (conf.bWantNewPeers){
@@ -2711,7 +2990,7 @@ function startRelay(){
 		setTimeout(checkIfHaveEnoughOutboundPeersAndAdd, 30*1000);
 		setInterval(purgeDeadPeers, 30*60*1000);
 	}
-	// purge peer_events every 6 hours, removing those older than 3 days ago.
+	// purge peer_events every 6 hours, removing those older than 0.5 days ago.
 	setInterval(purgePeerEvents, 6*60*60*1000);
 	
 	// request needed joints that were not received during the previous session
@@ -2720,7 +2999,8 @@ function startRelay(){
 	
 	setInterval(purgeJunkUnhandledJoints, 30*60*1000);
 	setInterval(joint_storage.purgeUncoveredNonserialJointsUnderLock, 60*1000);
-	setInterval(findAndHandleJointsThatAreReady, 5*1000);
+	setInterval(handleSavedPrivatePayments, 5*1000);
+	joint_storage.readDependentJointsThatAreReady(null, handleSavedJoint);
 }
 
 function startLightClient(){
@@ -2764,6 +3044,7 @@ exports.sendJustsaying = sendJustsaying;
 exports.sendAllInboundJustsaying = sendAllInboundJustsaying;
 exports.sendError = sendError;
 exports.sendRequest = sendRequest;
+exports.sendResponse = sendResponse;
 exports.findOutboundPeerOrConnect = findOutboundPeerOrConnect;
 exports.handleOnlineJoint = handleOnlineJoint;
 
@@ -2788,3 +3069,5 @@ exports.isConnected = isConnected;
 exports.isCatchingUp = isCatchingUp;
 exports.requestHistoryFor = requestHistoryFor;
 exports.exchangeRates = exchangeRates;
+exports.getInboundDeviceWebSocket = getInboundDeviceWebSocket;
+exports.deletePendingRequest = deletePendingRequest;

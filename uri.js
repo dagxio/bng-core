@@ -17,7 +17,7 @@ function parseUri(uri, callbacks){
 	
 	// pairing / start a chat
 //	var arrPairingMatches = value.match(/^([\w\/+]{44})@([\w.:\/-]+)(?:#|%23)([\w\/+]+)$/);
-	var arrPairingMatches = value.replace('%23', '#').match(/^([\w\/+]{44})@([\w.:\/-]+)#([\w\/+-]+)$/);
+	var arrPairingMatches = value.replace('%23', '#').match(/^([\w\/+]{44})@([\w.:\/-]+)#(.+)$/);
 	if (arrPairingMatches){
 		objRequest.type = "pairing";
 		objRequest.pubkey = arrPairingMatches[1];
@@ -58,12 +58,8 @@ function parseUri(uri, callbacks){
 		objRequest.params = assocParams;
 		return callbacks.ifOk(objRequest);
 	}
-
-	// claim textcoin using mnemonic
-	var arrMnemonicMatches = value.match(/^textcoin\?(.+)$/);
-	if (arrMnemonicMatches){
-		objRequest.type = "textcoin";
-		var mnemonic = arrMnemonicMatches[1].split('-').join(' ');
+	
+	function handleMnemonic(mnemonic){
 		try {
 			if (Mnemonic.isValid(mnemonic)) {
 				objRequest.mnemonic = mnemonic;
@@ -75,14 +71,28 @@ function parseUri(uri, callbacks){
 			return callbacks.ifError("invalid mnemonic");
 		}
 	}
+
+	// claim textcoin using mnemonic
+	var arrMnemonicMatches = value.match(/^textcoin\?(.+)$/);
+	if (arrMnemonicMatches){
+		objRequest.type = "textcoin";
+		var mnemonic = arrMnemonicMatches[1].split('-').join(' ');
+		return handleMnemonic(mnemonic);
+	}
+	var arrWords = value.split('-');
+	if (arrWords.length === 12){
+		objRequest.type = "textcoin";
+		mnemonic = arrWords.join(' ');
+		return handleMnemonic(mnemonic);
+	}
 	
 	// pay to address
 	var arrParts = value.split('?');
 	if (arrParts.length > 2)
 		return callbacks.ifError("too many question marks");
-	var address = arrParts[0];
+	var address = decodeURIComponent(arrParts[0]);
 	var query_string = arrParts[1];
-	if (!ValidationUtils.isValidAddress(address))
+	if (!ValidationUtils.isValidAddress(address) && !ValidationUtils.isValidEmail(address) && !address.match(/^(steem\/|reddit\/|@).{3,}/i) && !address.match(/^\+\d{9,14}$/))
 		return callbacks.ifError("address "+address+" is invalid");
 	objRequest.type = "address";
 	objRequest.address = address;

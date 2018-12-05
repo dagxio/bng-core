@@ -28,7 +28,7 @@ function validateDefinition(conn, arrDefinition, objUnit, objValidationState, ar
 	function getFilterError(filter){
 		if (!filter)
 			return "no filter";
-		if (hasFieldsExcept(filter, ["what", "asset", "type", "own_funds", "address", "amount", "amount_at_least", "amount_at_most"]))
+		if (hasFieldsExcept(filter, ["what", "asset", "type", "address", "amount", "amount_at_least", "amount_at_most"]))
 			return "unknown fields in filter";
 		if (filter.what !== "input" && filter.what !== "output")
 			return "invalid what="+filter.what;
@@ -39,18 +39,12 @@ function validateDefinition(conn, arrDefinition, objUnit, objValidationState, ar
 		if (filter.what === "output"){
 			if ("type" in filter)
 				return "output canot have type";
-			if ("own_funds" in filter)
-				return "output canot have own_funds";
 		}
-		if (bAssetCondition && "own_funds" in filter)
-			return "asset condition cannot be filtered by own_funds";
 		if ("type" in filter && filter.type !== "issue" && filter.type !== "transfer")
 			return "invalid type: "+filter.type;
-		if ("own_funds" in filter && typeof filter.own_funds !== "boolean")
-			return "own_funds must be boolean";
-		if (bAssetCondition && filter.address === 'this address')
-			return "asset condition cannot reference this address";
-		if ("address" in filter && !isValidAddress(filter.address) && filter.address !== 'this address') // it is ok if the address was never used yet
+		if (bAssetCondition && (filter.address === 'this address' || filter.address === 'other address'))
+			return "asset condition cannot reference this/other address";
+		if ("address" in filter && !isValidAddress(filter.address) && filter.address !== 'this address' && (filter.address !== 'other address' || objValidationState.last_ball_mci < constants.otherAddressInDefinitionUpgradeMci)) // it is ok if the address was never used yet
 			return "invalid address: "+filter.address;
 		if ("amount" in filter && !isPositiveInteger(filter.amount))
 			return "amount must be positive int";
@@ -326,12 +320,34 @@ function validateDefinition(conn, arrDefinition, objUnit, objValidationState, ar
 					return cb(op+" must have 2 args");
 				var changed_address = args[0];
 				var new_definition_chash = args[1];
-				if (bAssetCondition && (changed_address === 'this address' || new_definition_chash === 'this address'))
-					return cb("asset condition cannot reference this address in "+op);
+				if (bAssetCondition && (changed_address === 'this address' || new_definition_chash === 'this address' || changed_address === 'other address' || new_definition_chash === 'other address'))
+					return cb("asset condition cannot reference this/other address in "+op);
 				if (!isValidAddress(changed_address) && changed_address !== 'this address') // it is ok if the address was never used yet
 					return cb("invalid changed address");
-				if (!isValidAddress(new_definition_chash) && new_definition_chash !== 'this address')
+				if (!isValidAddress(new_definition_chash) && new_definition_chash !== 'this address' && new_definition_chash !== 'any')
 					return cb("invalid new definition chash");
+				if (new_definition_chash === 'any' && objValidationState.last_ball_mci < constants.anyDefinitionChangeUpgradeMci)
+					return cb("too early use of 'any' in new_definition_chash");
+				return cb();
+				
+			case 'attested':
+				if (objValidationState.bNoReferences)
+					return cb("no references allowed in address definition");
+				if (!isArrayOfLength(args, 2))
+					return cb(op+" must have 2 args");
+				var attested_address = args[0];
+				var arrAttestors = args[1];
+				if (bAssetCondition && attested_address === 'this address')
+					return cb("asset condition cannot reference this address in "+op);
+				if (!isValidAddress(attested_address) && attested_address !== 'this address') // it is ok if the address was never used yet
+					return cb("invalid attested address");
+				if (!ValidationUtils.isNonemptyArray(arrAttestors))
+					return cb("no attestors");
+				for (var i=0; i<arrAttestors.length; i++)
+					if (!isValidAddress(arrAttestors[i]))
+						return cb("invalid attestor address "+arrAttestors[i]);
+				if (objValidationState.last_ball_mci < constants.attestedInDefinitionUpgradeMci)
+					return cb(op+" not enabled yet");
 				return cb();
 				
 			case 'cosigned by':
@@ -443,10 +459,10 @@ function validateDefinition(conn, arrDefinition, objUnit, objValidationState, ar
 				if (op === 'seen'){
 					if (!args.address)
 						return cb('seen must specify address');
+					if (args.address === 'other address')
+						return cb('seen cannot be other address');
 					if (args.what === 'input' && (args.amount || args.amount_at_least || args.amount_at_most))
 						return cb('amount not allowed in seen input');
-					if ('own_funds' in args)
-						return cb('own_funds not allowed in seen');
 				}
 				if (!args.asset || args.asset === 'base' || bAssetCondition && args.asset === "this asset")
 					return cb();
@@ -727,11 +743,12 @@ function validateAuthentifiers(conn, address, this_asset, arrDefinition, objUnit
 					changed_address = address;
 				if (new_definition_chash === 'this address')
 					new_definition_chash = address;
+				var and_definition_chash = (new_definition_chash === 'any') ? '' : 'AND definition_chash='+db.escape(new_definition_chash);
 				conn.query(
 					"SELECT 1 FROM address_definition_changes CROSS JOIN units USING(unit) \n\
-					WHERE address=? AND definition_chash=? AND main_chain_index<=? AND sequence='good' AND is_stable=1 \n\
+					WHERE address=? "+and_definition_chash+" AND main_chain_index<=? AND sequence='good' AND is_stable=1 \n\
 					LIMIT 1",
-					[changed_address, new_definition_chash, objValidationState.last_ball_mci],
+					[changed_address, objValidationState.last_ball_mci],
 					function(rows){
 						cb2(rows.length > 0);
 					}
@@ -739,7 +756,7 @@ function validateAuthentifiers(conn, address, this_asset, arrDefinition, objUnit
 				break;
 				
 			case 'seen':
-				// ['seen', {what: 'input', asset: 'asset or base', type: 'transfer'|'issue', own_funds: true, amount_at_least: 123, amount_at_most: 123, amount: 123, address: 'BASE32'}]
+				// ['seen', {what: 'input', asset: 'asset or base', type: 'transfer'|'issue', amount_at_least: 123, amount_at_most: 123, amount: 123, address: 'BASE32'}]
 				var filter = args;
 				var sql = "SELECT 1 FROM "+filter.what+"s CROSS JOIN units USING(unit) \n\
 					LEFT JOIN assets ON asset=assets.unit \n\
@@ -779,6 +796,19 @@ function validateAuthentifiers(conn, address, this_asset, arrDefinition, objUnit
 				conn.query(sql, params, function(rows){
 					cb2(rows.length > 0);
 				});
+				break;
+				
+			case 'attested':
+				// ['attested', ['BASE32', ['BASE32']]]
+				var attested_address = args[0];
+				var arrAttestors = args[1];
+				if (attested_address === 'this address')
+					attested_address = address;
+				storage.filterAttestedAddresses(
+					conn, {arrAttestorAddresses: arrAttestors}, objValidationState.last_ball_mci, [attested_address], function(arrFilteredAddresses){
+						cb2(arrFilteredAddresses.length > 0);
+					}
+				);
 				break;
 				
 			case 'cosigned by':
@@ -917,8 +947,8 @@ function validateAuthentifiers(conn, address, this_asset, arrDefinition, objUnit
 				
 			case 'has':
 			case 'has one':
-				// ['has', {what: 'input', asset: 'asset or base', type: 'transfer'|'issue', own_funds: true, amount_at_least: 123, amount_at_most: 123, amount: 123, address: 'BASE32'}]
-				// when an address is included (referenced from another address), own_funds refers to outer address' funds
+				// ['has', {what: 'input', asset: 'asset or base', type: 'transfer'|'issue', amount_at_least: 123, amount_at_most: 123, amount: 123, address: 'BASE32'}]
+				// when an address is included (referenced from another address), "this address" refers to the outer address
 				augmentMessagesAndEvaluateFilter(op, args, function(res){
 					console.log(op+" "+res, args);
 					cb2(res);
@@ -927,7 +957,7 @@ function validateAuthentifiers(conn, address, this_asset, arrDefinition, objUnit
 				
 			case 'has equal':
 			case 'has one equal':
-				// ['has equal', {equal_fields: ['address', 'amount'], search_criteria: [{what: 'output', asset: 'asset1', address: 'BASE32'}, {what: 'input', asset: 'asset2', type: 'issue', own_funds: true, address: 'ANOTHERBASE32'}]}]
+				// ['has equal', {equal_fields: ['address', 'amount'], search_criteria: [{what: 'output', asset: 'asset1', address: 'BASE32'}, {what: 'input', asset: 'asset2', type: 'issue', address: 'ANOTHERBASE32'}]}]
 				augmentMessagesAndEvaluateFilter("has", args.search_criteria[0], function(res1, arrFirstObjects){
 					if (!res1)
 						return cb2(false);
@@ -951,7 +981,7 @@ function validateAuthentifiers(conn, address, this_asset, arrDefinition, objUnit
 				break;
 				
 			case 'sum':
-				// ['sum', {filter: {what: 'input', asset: 'asset or base', type: 'transfer'|'issue', own_funds: true, address: 'BASE32'}, at_least: 123, at_most: 123, equals: 123}]
+				// ['sum', {filter: {what: 'input', asset: 'asset or base', type: 'transfer'|'issue', address: 'BASE32'}, at_least: 123, at_most: 123, equals: 123}]
 				augmentMessagesAndEvaluateFilter("has", args.filter, function(res, arrFoundObjects){
 					var sum = 0;
 					if (res)
@@ -960,11 +990,11 @@ function validateAuthentifiers(conn, address, this_asset, arrDefinition, objUnit
 					console.log("sum="+sum);
 					if (typeof args.equals === "number" && sum === args.equals)
 						return cb2(true);
-					if (typeof args.at_least === "number" && sum >= args.at_least)
-						return cb2(true);
-					if (typeof args.at_most === "number" && sum <= args.at_most)
-						return cb2(true);
-					cb2(false);
+					if (typeof args.at_least === "number" && sum < args.at_least)
+						return cb2(false);
+					if (typeof args.at_most === "number" && sum > args.at_most)
+						return cb2(false);
+					cb2(true);
 				});
 				break;
 				
@@ -981,10 +1011,10 @@ function validateAuthentifiers(conn, address, this_asset, arrDefinition, objUnit
 						return false;
 					if (!message.payload)
 						return false;
-					if (message.payload.definition_chash !== new_definition_chash)
+					if (new_definition_chash !== 'any' && message.payload.definition_chash !== new_definition_chash)
 						return false;
-					var address = message.payload.address || objUnit.authors[0].address;
-					return (address === changed_address);
+					var payload_address = message.payload.address || objUnit.authors[0].address;
+					return (payload_address === changed_address);
 				}));
 				break;
 				
@@ -1004,7 +1034,7 @@ function validateAuthentifiers(conn, address, this_asset, arrDefinition, objUnit
 			//console.log("augmented: ", objValidationState.arrAugmentedMessages[0].payload);
 			evaluateFilter(op, filter, handleResult);
 		}
-		if (!objValidationState.arrAugmentedMessages && filter.what === "input" && (filter.address || "own_funds" in filter || typeof filter.amount === "number" || typeof filter.amount_at_least === "number" || typeof filter.amount_at_most === "number"))
+		if (!objValidationState.arrAugmentedMessages && filter.what === "input" && (filter.address || typeof filter.amount === "number" || typeof filter.amount_at_least === "number" || typeof filter.amount_at_most === "number"))
 			augmentMessages(doEvaluateFilter);
 		else
 			doEvaluateFilter();
@@ -1012,9 +1042,6 @@ function validateAuthentifiers(conn, address, this_asset, arrDefinition, objUnit
 	
 	
 	function evaluateFilter(op, filter, handleResult){
-		var filter_address = filter.address;
-		if (filter_address === 'this address')
-			filter_address = address;
 		var arrFoundObjects = [];
 		for (var i=0; i<objUnit.messages.length; i++){
 			var message = objUnit.messages[i];
@@ -1045,26 +1072,47 @@ function validateAuthentifiers(conn, address, this_asset, arrDefinition, objUnit
 						if (type !== filter.type)
 							continue;
 					}
-					if (filter.own_funds && objValidationState.arrAugmentedMessages[i].payload.inputs[j].address !== address)
+					var augmented_input = objValidationState.arrAugmentedMessages ? objValidationState.arrAugmentedMessages[i].payload.inputs[j] : null;
+					if (filter.address){
+						if (filter.address === 'this address'){
+							if (augmented_input.address !== address)
+								continue;
+						}
+						else if (filter.address === 'other address'){
+							if (augmented_input.address === address)
+								continue;
+						}
+						else { // normal address
+							if (augmented_input.address !== filter.address)
+								continue;
+						}
+					}
+					if (filter.amount && augmented_input.amount !== filter.amount)
 						continue;
-					if (filter.own_funds === false && objValidationState.arrAugmentedMessages[i].payload.inputs[j].address === address)
+					if (filter.amount_at_least && augmented_input.amount < filter.amount_at_least)
 						continue;
-					if (filter_address && objValidationState.arrAugmentedMessages[i].payload.inputs[j].address !== filter_address)
+					if (filter.amount_at_most && augmented_input.amount > filter.amount_at_most)
 						continue;
-					if (filter.amount && objValidationState.arrAugmentedMessages[i].payload.inputs[j].amount !== filter.amount)
-						continue;
-					if (filter.amount_at_least && objValidationState.arrAugmentedMessages[i].payload.inputs[j].amount < filter.amount_at_least)
-						continue;
-					if (filter.amount_at_most && objValidationState.arrAugmentedMessages[i].payload.inputs[j].amount > filter.amount_at_most)
-						continue;
-					arrFoundObjects.push(objValidationState.arrAugmentedMessages[i].payload.inputs[j]);
+					arrFoundObjects.push(augmented_input || input);
 				}
 			} // input
 			else if (filter.what === "output"){
 				for (var j=0; j<payload.outputs.length; j++){
 					var output = payload.outputs[j];
-					if (filter_address && output.address !== filter_address)
-						continue;
+					if (filter.address){
+						if (filter.address === 'this address'){
+							if (output.address !== address)
+								continue;
+						}
+						else if (filter.address === 'other address'){
+							if (output.address === address)
+								continue;
+						}
+						else { // normal address
+							if (output.address !== filter.address)
+								continue;
+						}
+					}
 					if (filter.amount && output.amount !== filter.amount)
 						continue;
 					if (filter.amount_at_least && output.amount < filter.amount_at_least)
@@ -1137,6 +1185,7 @@ function validateAuthentifiers(conn, address, this_asset, arrDefinition, objUnit
 	var bAssetCondition = (assocAuthentifiers === null);
 	if (bAssetCondition && address || !bAssetCondition && this_asset)
 		throw Error("incompatible params");
+	var arrAuthentifierPaths = bAssetCondition ? null : Object.keys(assocAuthentifiers);
 	var fatal_error = null;
 	var arrUsedPaths = [];
 	
@@ -1145,7 +1194,7 @@ function validateAuthentifiers(conn, address, this_asset, arrDefinition, objUnit
 	// 2. redefinition of a referenced address might introduce loops that will drive complexity to infinity
 	// 3. if an inner address was redefined by keychange but the definition for the new keyset not supplied before last ball, the address 
 	// becomes temporarily unusable
-	validateDefinition(conn, arrDefinition, objUnit, objValidationState, Object.keys(assocAuthentifiers), bAssetCondition, function(err){
+	validateDefinition(conn, arrDefinition, objUnit, objValidationState, arrAuthentifierPaths, bAssetCondition, function(err){
 		if (err)
 			return cb(err);
 		//console.log("eval def");

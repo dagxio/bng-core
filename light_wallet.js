@@ -14,6 +14,8 @@ var RECONNECT_TO_LIGHT_VENDOR_PERIOD = 60*1000;
 
 
 function setLightVendorHost(light_vendor_host){
+	if (network.light_vendor_url)
+		return console.log("light_vendor_url is already set, current:" + network.light_vendor_url + ", new one:" + light_vendor_host);
 	network.light_vendor_url = conf.WS_PROTOCOL+light_vendor_host; // for now, light vendor is also a hub
 	if (conf.bLight){
 		refreshLightClientHistory();
@@ -60,9 +62,9 @@ function prepareRequestForHistory(handleResult){
 				objHistoryRequest.last_stable_mci = 0;
 				var strAddressList = arrAddresses.map(db.escape).join(', ');
 				db.query(
-					"SELECT unit FROM unit_authors JOIN units USING(unit) WHERE is_stable=1 AND address IN("+strAddressList+") \n\
+					"SELECT unit FROM unit_authors CROSS JOIN units USING(unit) WHERE is_stable=1 AND address IN("+strAddressList+") \n\
 					UNION \n\
-					SELECT unit FROM outputs JOIN units USING(unit) WHERE is_stable=1 AND address IN("+strAddressList+")",
+					SELECT unit FROM outputs CROSS JOIN units USING(unit) WHERE is_stable=1 AND address IN("+strAddressList+")",
 					function(rows){
 						if (rows.length)
 							objHistoryRequest.known_stable_units = rows.map(function(row){ return row.unit; });
@@ -120,9 +122,9 @@ function refreshLightClientHistory(){
 				}
 				ws.bLightVendor = true;
 				var interval = setInterval(function(){ // refresh UI periodically while we are processing history
-					eventBus.emit('maybe_new_transactions');
-				}, 500);
-				light.processHistory(response, {
+				//	eventBus.emit('maybe_new_transactions');
+				}, 10*1000);
+				light.processHistory(response, objRequest.witnesses, {
 					ifError: function(err){
 						clearInterval(interval);
 						network.sendError(ws, err);
@@ -141,7 +143,8 @@ function refreshLightClientHistory(){
 }
 
 function archiveDoublespendUnits(){
-	db.query("SELECT unit FROM units WHERE is_stable=0 AND is_free=1 AND creation_date<"+db.addTime('-1 DAY'), function(rows){
+	var col = (conf.storage === 'sqlite') ? 'rowid' : 'creation_date';
+	db.query("SELECT unit FROM units WHERE is_stable=0 AND creation_date<"+db.addTime('-1 DAY')+" ORDER BY "+col+" DESC", function(rows){
 		var arrUnits = rows.map(function(row){ return row.unit; });
 		breadcrumbs.add("units still unstable after 1 day: "+arrUnits.join(', '));
 		arrUnits.forEach(function(unit){
@@ -160,6 +163,14 @@ function archiveDoublespendUnits(){
 if (conf.bLight){
 //	setTimeout(archiveDoublespendUnits, 5*1000);
 	setInterval(archiveDoublespendUnits, 24*3600*1000);
+	eventBus.on('new_my_transactions', function(arrUnits){
+		db.query("SELECT DISTINCT asset FROM outputs WHERE unit IN("+arrUnits.map(db.escape).join(',')+") AND asset IS NOT NULL", function(rows){
+			if (rows.length === 0)
+				return;
+			var arrAssets = rows.map(function(row){ return row.asset; });
+			network.requestProofsOfJointsIfNewOrUnstable(arrAssets);
+		});
+	});
 }
 
 exports.setLightVendorHost = setLightVendorHost;

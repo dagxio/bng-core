@@ -13,6 +13,7 @@ var mutex = require('./mutex.js');
 var eventBus = require('./event_bus.js');
 var profiler = require('./profiler.js');
 var breadcrumbs = require('./breadcrumbs.js');
+var conf = require('./conf.js');
 
 // override when adding units which caused witnessed level to significantly retreat
 var arrRetreatingUnits = [
@@ -86,7 +87,9 @@ function updateMainChain(conn, from_unit, last_added_unit, onDone){
 				}
 				var objBestParentUnitPropsForCheck = _.cloneDeep(objBestParentUnitProps2);
 				delete objBestParentUnitPropsForCheck.parent_units;
-				if (!_.isEqual(objBestParentUnitPropsForCheck, objBestParentUnitProps))
+				if (!storage.isGenesisUnit(best_parent_unit))
+					delete objBestParentUnitPropsForCheck.earned_headers_commission_recipients;
+				if (!conf.bFaster && !_.isEqual(objBestParentUnitPropsForCheck, objBestParentUnitProps))
 					throwError("different props, db: "+JSON.stringify(objBestParentUnitProps)+", unstable: "+JSON.stringify(objBestParentUnitProps2));
 				if (!objBestParentUnitProps.is_on_main_chain)
 					conn.query("UPDATE units SET is_on_main_chain=1, main_chain_index=NULL WHERE unit=?", [best_parent_unit], function(){
@@ -138,10 +141,10 @@ function updateMainChain(conn, from_unit, last_added_unit, onDone){
 				}
 				var main_chain_index = last_main_chain_index;
 				var main_chain_unit = last_main_chain_unit;
-				conn.query(
+				conn.cquery(
 					"SELECT unit FROM units WHERE is_on_main_chain=1 AND main_chain_index IS NULL ORDER BY level",
 					function(rows){
-						if (rows.length === 0){
+						if (!conf.bFaster && rows.length === 0){
 							//if (last_main_chain_index > 0)
 								throw Error("no unindexed MC units after adding "+last_added_unit);
 							//else{
@@ -149,24 +152,25 @@ function updateMainChain(conn, from_unit, last_added_unit, onDone){
 							//    return updateLatestIncludedMcIndex(last_main_chain_index, true);
 							//}
 						}
-						var arrDbNewMcUnits = rows.map(function(row){ return row.unit; });
 						arrNewMcUnits.reverse();
-						if (!_.isEqual(arrNewMcUnits, arrDbNewMcUnits))
-							throwError("different new MC units, arr: "+JSON.stringify(arrNewMcUnits)+", db: "+JSON.stringify(arrDbNewMcUnits));
+						if (!conf.bFaster){
+							var arrDbNewMcUnits = rows.map(function(row){ return row.unit; });
+							if (!_.isEqual(arrNewMcUnits, arrDbNewMcUnits))
+								throwError("different new MC units, arr: "+JSON.stringify(arrNewMcUnits)+", db: "+JSON.stringify(arrDbNewMcUnits));
+						}
 						async.eachSeries(
-							rows, 
-							function(row, cb){
+							conf.bFaster ? arrNewMcUnits : arrDbNewMcUnits, 
+							function(mc_unit, cb){
 								main_chain_index++;
-								var arrUnits = [row.unit];
+								var arrUnits = [mc_unit];
 								
 								function goUp(arrStartUnits){
-									conn.query(
+									conn.cquery(
 										"SELECT DISTINCT unit \n\
 										FROM parenthoods JOIN units ON parent_unit=unit \n\
 										WHERE child_unit IN(?) AND main_chain_index IS NULL",
 										[arrStartUnits],
 										function(rows){
-											var arrNewStartUnits = rows.map(function(row){ return row.unit; });
 											var arrNewStartUnits2 = [];
 											arrStartUnits.forEach(function(start_unit){
 												storage.assocUnstableUnits[start_unit].parent_units.forEach(function(parent_unit){
@@ -174,7 +178,8 @@ function updateMainChain(conn, from_unit, last_added_unit, onDone){
 														arrNewStartUnits2.push(parent_unit);
 												});
 											});
-											if (!_.isEqual(arrNewStartUnits.sort(), arrNewStartUnits2.sort()))
+											var arrNewStartUnits = conf.bFaster ? arrNewStartUnits2 : rows.map(function(row){ return row.unit; });
+											if (!conf.bFaster && !_.isEqual(arrNewStartUnits.sort(), arrNewStartUnits2.sort()))
 												throwError("different new start units, arr: "+JSON.stringify(arrNewStartUnits2)+", db: "+JSON.stringify(arrNewStartUnits));
 											if (arrNewStartUnits.length === 0)
 												return updateMc();
@@ -222,7 +227,7 @@ function updateMainChain(conn, from_unit, last_added_unit, onDone){
 		
 		function checkAllLatestIncludedMcIndexesAreSet(){
 			profiler.start();
-			if (!_.isEqual(assocDbLimcisByUnit, assocLimcisByUnit))
+			if (!conf.bFaster && !_.isEqual(assocDbLimcisByUnit, assocLimcisByUnit))
 				throwError("different  LIMCIs, mem: "+JSON.stringify(assocLimcisByUnit)+", db: "+JSON.stringify(assocDbLimcisByUnit));
 			conn.query("SELECT unit FROM units WHERE latest_included_mc_index IS NULL AND level!=0", function(rows){
 				if (rows.length > 0)
@@ -342,6 +347,15 @@ function updateMainChain(conn, from_unit, last_added_unit, onDone){
 			}
 		}
 		calcLIMCIs(function(){
+			if (conf.bFaster){
+				return async.forEachOfSeries(
+					assocLimcisByUnit,
+					function(limci, unit, cb){
+						conn.query("UPDATE units SET latest_included_mc_index=? WHERE unit=?", [limci, unit], function(){ cb(); });
+					},
+					checkAllLatestIncludedMcIndexesAreSet
+				);
+			}
 			conn.query("UPDATE units SET latest_included_mc_index=NULL WHERE main_chain_index>? OR main_chain_index IS NULL", [last_main_chain_index], function(res){
 				console.log("update LIMCI=NULL done, matched rows: "+res.affectedRows);
 				profiler.stop('mc-limci-set-null');
@@ -406,6 +420,38 @@ function updateMainChain(conn, from_unit, last_added_unit, onDone){
 		});
 	}
 
+	function findMinMcWitnessedLevel(tip_unit, first_unstable_mc_level, arrWitnesses, handleMinMcWl){
+		var arrCollectedWitnesses = [];
+		var min_mc_wl = Number.POSITIVE_INFINITY;
+
+		function addWitnessesAndGoUp(start_unit){
+			storage.readStaticUnitProps(conn, start_unit, function(props){
+				var best_parent_unit = props.best_parent_unit;
+				var level = props.level;
+				if (level === null)
+					throw Error("null level in findMinMcWitnessedLevel");
+				if (level < first_unstable_mc_level) {
+					console.log("unit " + start_unit + ", level=" + level + ", first_unstable_mc_level=" + first_unstable_mc_level + ", min_mc_wl=" + min_mc_wl);
+					return handleMinMcWl(-1);
+				}
+				storage.readUnitAuthors(conn, start_unit, function(arrAuthors){
+					for (var i=0; i<arrAuthors.length; i++){
+						var address = arrAuthors[i];
+						if (arrWitnesses.indexOf(address) !== -1 && arrCollectedWitnesses.indexOf(address) === -1) {
+							arrCollectedWitnesses.push(address);
+							var witnessed_level = props.witnessed_level;
+							if (min_mc_wl > witnessed_level)
+								min_mc_wl = witnessed_level;
+						}
+					}
+					(arrCollectedWitnesses.length < constants.MAJORITY_OF_WITNESSES) 
+						? addWitnessesAndGoUp(best_parent_unit) : handleMinMcWl(min_mc_wl);
+				});
+			});
+		}
+
+		addWitnessesAndGoUp(tip_unit);
+	}
 	
 	function updateStableMcFlag(){
 		console.log("updateStableMcFlag");
@@ -433,20 +479,17 @@ function updateMainChain(conn, from_unit, last_added_unit, onDone){
 						markMcIndexStable(conn, first_unstable_mc_index, updateStableMcFlag);
 					}
 				
-					conn.query("SELECT witnessed_level FROM units WHERE is_free=1 AND is_on_main_chain=1", function(wl_rows){
-						if (wl_rows.length !== 1)
-							throw Error("not a single mc wl");
+					conn.query("SELECT unit FROM units WHERE is_free=1 AND is_on_main_chain=1", function(tip_rows){
+						if (tip_rows.length !== 1)
+							throw Error("not a single mc tip");
 						// this is the level when we colect 7 witnesses if walking up the MC from its end
-						var mc_end_witnessed_level = wl_rows[0].witnessed_level;
-						conn.query(
-							// among these 7 witnesses, find min wl
-							"SELECT MIN(witnessed_level) AS min_mc_wl FROM units LEFT JOIN unit_authors USING(unit) \n\
-							WHERE is_on_main_chain=1 AND level>=? AND address IN(?)", // _left_ join enforces the best query plan in sqlite
-							[mc_end_witnessed_level, arrWitnesses],
-							function(min_wl_rows){
-								if (min_wl_rows.length !== 1)
-									throw Error("not a single min mc wl");
-								var min_mc_wl = min_wl_rows[0].min_mc_wl;
+						var tip_unit = tip_rows[0].unit;
+						findMinMcWitnessedLevel(tip_unit, first_unstable_mc_level, arrWitnesses,
+							function(min_mc_wl){
+								console.log("minimum witnessed level "+min_mc_wl);
+								if (min_mc_wl == -1)
+									return finish();
+
 								if (arrAltBranchRootUnits.length === 0){ // no alt branches
 									if (min_mc_wl >= first_unstable_mc_level) 
 										return advanceLastStableMcUnitAndTryNext();
@@ -468,24 +511,9 @@ function updateMainChain(conn, from_unit, last_added_unit, onDone){
 									*/
 								}
 								createListOfBestChildren(arrAltBranchRootUnits, function(arrAltBestChildren){
-									// Compose a set S of units that increase WL, that is their own WL is greater than that of every parent. 
-									// In this set, find max L. Alt WL will never reach it. If min_mc_wl > L, next MC unit is stable.
-									// Also filter the set S to include only those units that are conformant with the last stable MC unit.
-									conn.query(
-										"SELECT MAX(units.level) AS max_alt_level \n\
-										FROM units \n\
-										LEFT JOIN parenthoods ON units.unit=child_unit \n\
-										LEFT JOIN units AS punits ON parent_unit=punits.unit AND punits.witnessed_level >= units.witnessed_level \n\
-										WHERE units.unit IN(?) AND punits.unit IS NULL AND ( \n\
-											SELECT COUNT(*) \n\
-											FROM unit_witnesses \n\
-											WHERE unit_witnesses.unit IN(units.unit, units.witness_list_unit) AND unit_witnesses.address IN(?) \n\
-										)>=?",
-										[arrAltBestChildren, arrWitnesses, constants.COUNT_WITNESSES - constants.MAX_WITNESS_LIST_MUTATIONS],
-										function(max_alt_rows){
-											if (max_alt_rows.length !== 1)
-												throw Error("not a single max alt level");
-											var max_alt_level = max_alt_rows[0].max_alt_level;
+									determineMaxAltLevel(
+										conn, first_unstable_mc_index, first_unstable_mc_level, arrAltBestChildren, arrWitnesses,
+										function(max_alt_level){
 											(min_mc_wl > max_alt_level) ? advanceLastStableMcUnitAndTryNext() : finish();
 										}
 									);
@@ -580,17 +608,100 @@ function createListOfPrivateMcUnits(start_unit, min_level, handleList){
 
 */
 
+
+function readBestChildrenProps(conn, arrUnits, handleResult){
+	if (arrUnits.every(function(unit){ return !!storage.assocUnstableUnits[unit]; })){
+		var arrProps = [];
+		arrUnits.forEach(function(unit){
+			if (storage.assocBestChildren[unit])
+				arrProps = arrProps.concat(storage.assocBestChildren[unit]);
+		});
+		return handleResult(arrProps);
+	}
+	conn.query("SELECT unit, is_on_main_chain, main_chain_index, level, is_free FROM units WHERE best_parent_unit IN(?)", [arrUnits], function(rows){
+		if (arrUnits.every(function(unit){ return !!storage.assocUnstableUnits[unit]; })){
+			var arrProps = [];
+			arrUnits.forEach(function(unit){
+				if (storage.assocBestChildren[unit])
+					arrProps = arrProps.concat(storage.assocBestChildren[unit]);
+			});
+			if (!arraysEqual(_.sortBy(rows, 'unit'), _.sortBy(arrProps, 'unit'), ['unit', 'is_on_main_chain', 'main_chain_index', 'level', 'is_free']))
+				throwError("different best children of "+arrUnits.join(', ')+": db "+JSON.stringify(rows)+", mem "+JSON.stringify(arrProps));
+		}
+		handleResult(rows);
+	});
+}
+
+function arraysEqual(arr1, arr2, fields){
+	if (arr1.length !== arr2.length)
+		return false;
+	for (var i=0; i<arr1.length; i++)
+		for (var j=0; j<fields.length; j++)
+			if (arr1[i][fields[i]] !== arr2[i][fields[i]])
+				return false;
+	return true;
+}
+
+function determineMaxAltLevel(conn, first_unstable_mc_index, first_unstable_mc_level, arrAltBestChildren, arrWitnesses, handleResult){
+//	console.log('=============  alt branch children\n', arrAltBestChildren.join('\n'));
+	// Compose a set S of units that increase WL, that is their own WL is greater than that of every parent. 
+	// In this set, find max L. Alt WL will never reach it. If min_mc_wl > L, next MC unit is stable.
+	// Also filter the set S to include only those units that are conformant with the last stable MC unit.
+	if (first_unstable_mc_index >= constants.altBranchByBestParentUpgradeMci){
+		conn.query(
+			"SELECT MAX(units.level) AS max_alt_level \n\
+			FROM units \n\
+			CROSS JOIN units AS bpunits \n\
+				ON units.best_parent_unit=bpunits.unit AND bpunits.witnessed_level < units.witnessed_level \n\
+			WHERE units.unit IN("+arrAltBestChildren.map(db.escape).join(', ')+")",
+			function(max_alt_rows){
+				var max_alt_level = max_alt_rows[0].max_alt_level; // can be null
+			//	console.log('===== min_mc_wl='+min_mc_wl+', max_alt_level='+max_alt_level+", first_unstable_mc_level="+first_unstable_mc_level);
+				handleResult(max_alt_level || first_unstable_mc_level);
+			}
+		);
+	}
+	else{
+		// this sql query is totally wrong but we still leave it for compatibility
+		conn.query(
+			"SELECT MAX(units.level) AS max_alt_level \n\
+			FROM units \n\
+			LEFT JOIN parenthoods ON units.unit=child_unit \n\
+			LEFT JOIN units AS punits ON parent_unit=punits.unit AND punits.witnessed_level >= units.witnessed_level \n\
+			WHERE units.unit IN("+arrAltBestChildren.map(db.escape).join(', ')+") AND punits.unit IS NULL AND ( \n\
+				SELECT COUNT(*) \n\
+				FROM unit_witnesses \n\
+				WHERE unit_witnesses.unit IN(units.unit, units.witness_list_unit) AND unit_witnesses.address IN(?) \n\
+			)>=?",
+			[arrWitnesses, constants.COUNT_WITNESSES - constants.MAX_WITNESS_LIST_MUTATIONS],
+			function(max_alt_rows){
+				if (max_alt_rows.length !== 1)
+					throw Error("not a single max alt level");
+				var max_alt_level = max_alt_rows[0].max_alt_level;
+			//	console.log('===== min_mc_wl='+min_mc_wl+', max_alt_level='+max_alt_level+", first_unstable_mc_level="+first_unstable_mc_level);
+				handleResult(max_alt_level);
+			}
+		);
+	}
+}
+
+
 function determineIfStableInLaterUnits(conn, earlier_unit, arrLaterUnits, handleResult){
 	if (storage.isGenesisUnit(earlier_unit))
 		return handleResult(true);
 	// hack to workaround past validation error
 	if (earlier_unit === 'LGFzduLJNQNzEqJqUXdkXr58wDYx77V8WurDF3+GIws=' && arrLaterUnits.join(',') === '6O4t3j8kW0/Lo7n2nuS8ITDv2UbOhlL9fF1M6j/PrJ4=')
 		return handleResult(true);
+	var start_time = Date.now();
 	storage.readPropsOfUnits(conn, earlier_unit, arrLaterUnits, function(objEarlierUnitProps, arrLaterUnitProps){
 		if (objEarlierUnitProps.is_free === 1)
 			return handleResult(false);
 		var max_later_limci = Math.max.apply(
 			null, arrLaterUnitProps.map(function(objLaterUnitProps){ return objLaterUnitProps.latest_included_mc_index; }));
+		var max_later_level = Math.max.apply(
+			null, arrLaterUnitProps.map(function(objLaterUnitProps){ return objLaterUnitProps.level; }));
+		var max_later_witnessed_level = Math.max.apply(
+			null, arrLaterUnitProps.map(function(objLaterUnitProps){ return objLaterUnitProps.witnessed_level; }));
 		readBestParentAndItsWitnesses(conn, earlier_unit, function(best_parent_unit, arrWitnesses){
 			conn.query("SELECT unit, is_on_main_chain, main_chain_index, level FROM units WHERE best_parent_unit=?", [best_parent_unit], function(rows){
 				if (rows.length === 0)
@@ -631,18 +742,19 @@ function determineIfStableInLaterUnits(conn, earlier_unit, arrLaterUnits, handle
 										}
 									}
 								}
-								if (min_mc_wl === -1)
-									throw Error("couldn't collect 7 witnesses");
 							//	var min_mc_wl = rows[constants.MAJORITY_OF_WITNESSES-1].witnessed_level;
-								if (first_unstable_mc_index > constants.branchedMinMcWlUpgradeMci)
+								if (first_unstable_mc_index > constants.branchedMinMcWlUpgradeMci){
+									if (min_mc_wl === -1)
+										throw Error("couldn't collect 7 witnesses, earlier unit "+earlier_unit+", best children "+arrBestChildren.join(', ')+", later "+arrLaterUnits.join(', ')+", witnesses "+arrWitnesses.join(', ')+", collected witnesses "+arrCollectedWitnesses.join(', '));
 									return handleMinMcWl(min_mc_wl);
+								}
 								// it might be more optimistic because it collects 7 witness units, not 7 units posted by _different_ witnesses
 								findMinMcWitnessedLevelOld(function(old_min_mc_wl){
 									var diff = min_mc_wl - old_min_mc_wl;
 									console.log("---------- new min_mc_wl="+min_mc_wl+", old min_mc_wl="+old_min_mc_wl+", diff="+diff+", later "+arrLaterUnits.join(', '));
 								//	if (diff < 0)
 								//		throw Error("new min_mc_wl="+min_mc_wl+", old min_mc_wl="+old_min_mc_wl+", diff="+diff+" for earlier "+earlier_unit+", later "+arrLaterUnits.join(', '));
-									handleMinMcWl(old_min_mc_wl);
+									handleMinMcWl(Math.max(old_min_mc_wl, min_mc_wl));
 								});
 							}
 						);
@@ -660,7 +772,7 @@ function determineIfStableInLaterUnits(conn, earlier_unit, arrLaterUnits, handle
 							FROM units WHERE unit=?", [arrWitnesses, start_unit],
 							function(rows){
 								if (rows.length !== 1)
-									throw Error("findMinMcWitnessedLevel: not 1 row");
+									throw Error("findMinMcWitnessedLevelOld: not 1 row");
 								var row = rows[0];
 								if (row.count > 0 && row.witnessed_level < min_mc_wl)
 									min_mc_wl = row.witnessed_level;
@@ -712,8 +824,11 @@ function determineIfStableInLaterUnits(conn, earlier_unit, arrLaterUnits, handle
 					if (arrAltBranchRootUnits.length === 0)
 						return handleBestChildrenList([]);
 					var arrBestChildren = [];
+					var arrTips = [];
+					var arrNotIncludedTips = [];
+					var arrRemovedBestChildren = [];
 
-					function goDownAndCollectBestChildren(arrStartUnits, cb){
+					function goDownAndCollectBestChildrenOld(arrStartUnits, cb){
 						conn.query("SELECT unit, is_free, main_chain_index FROM units WHERE best_parent_unit IN(?)", [arrStartUnits], function(rows){
 							if (rows.length === 0)
 								return cb();
@@ -726,7 +841,7 @@ function determineIfStableInLaterUnits(conn, earlier_unit, arrLaterUnits, handle
 										if (row.is_free === 1 || arrLaterUnits.indexOf(row.unit) >= 0)
 											cb2();
 										else
-											goDownAndCollectBestChildren([row.unit], cb2);
+											goDownAndCollectBestChildrenOld([row.unit], cb2);
 									}
 									
 									if (row.main_chain_index !== null && row.main_chain_index <= max_later_limci)
@@ -741,8 +856,98 @@ function determineIfStableInLaterUnits(conn, earlier_unit, arrLaterUnits, handle
 						});
 					}
 
+					function goDownAndCollectBestChildrenFast(arrStartUnits, cb){
+						readBestChildrenProps(conn, arrStartUnits, function(rows){
+							if (rows.length === 0){
+								arrStartUnits.forEach(function(start_unit){
+									arrTips.push(start_unit);
+								});
+								return cb();
+							}
+							async.eachSeries(
+								rows, 
+								function(row, cb2){
+									arrBestChildren.push(row.unit);
+									if (arrLaterUnits.indexOf(row.unit) >= 0)
+										cb2();
+									else if (
+										row.is_free === 1
+										|| row.level >= max_later_level
+										|| row.witnessed_level > max_later_witnessed_level && first_unstable_mc_index >= constants.witnessedLevelMustNotRetreatUpgradeMci
+										|| row.latest_included_mc_index > max_later_limci
+										|| row.is_on_main_chain && row.main_chain_index > max_later_limci
+									){
+										arrTips.push(row.unit);
+										arrNotIncludedTips.push(row.unit);
+										cb2();
+									}
+									else
+										goDownAndCollectBestChildrenFast([row.unit], cb2);
+								},
+								cb
+							);
+						});
+					}
+					
+					function findBestChildrenNotIncludedInLaterUnits(arrUnits, cb){
+						var arrUnitsToRemove = [];
+						async.eachSeries(
+							arrUnits, 
+							function(unit, cb2){
+								if (arrRemovedBestChildren.indexOf(unit) >= 0)
+									return cb2();
+								if (arrNotIncludedTips.indexOf(unit) >= 0){
+									arrUnitsToRemove.push(unit);
+									return cb2();
+								}
+								graph.determineIfIncludedOrEqual(conn, unit, arrLaterUnits, function(bIncluded){
+									if (!bIncluded)
+										arrUnitsToRemove.push(unit);
+									cb2();
+								});
+							},
+							function(){
+								if (arrUnitsToRemove.length === 0)
+									return cb();
+								arrRemovedBestChildren = arrRemovedBestChildren.concat(arrUnitsToRemove);
+								goUp(arrUnitsToRemove, cb);
+							}
+						);
+					}
+					
+					function goUp(arrCurrentTips, cb){
+						var arrUnits = [];
+						async.eachSeries(
+							arrCurrentTips,
+							function(unit, cb2){
+								storage.readStaticUnitProps(conn, unit, function(props){
+									if (arrUnits.indexOf(props.best_parent_unit) === -1)
+										arrUnits.push(props.best_parent_unit);
+									cb2();
+								});
+							},
+							function(){
+								findBestChildrenNotIncludedInLaterUnits(arrUnits, cb);
+							}
+						);
+					}
+					
+					function collectBestChildren(arrFilteredAltBranchRootUnits, cb){
+						goDownAndCollectBestChildrenFast(arrFilteredAltBranchRootUnits, function(){
+							if (arrTips.length === 0)
+								return cb();
+							var start_time = Date.now();
+							findBestChildrenNotIncludedInLaterUnits(arrTips, function(){
+								console.log("findBestChildrenNotIncludedInLaterUnits took "+(Date.now()-start_time)+"ms");
+								arrBestChildren = _.difference(arrBestChildren, arrRemovedBestChildren);
+								cb();
+							});
+						});
+					}
+
 					// leaves only those roots that are included by later units
 					function filterAltBranchRootUnits(cb){
+						//console.log('===== before filtering:', arrAltBranchRootUnits);
 						var arrFilteredAltBranchRootUnits = [];
 						conn.query("SELECT unit, is_free, main_chain_index FROM units WHERE unit IN(?)", [arrAltBranchRootUnits], function(rows){
 							if (rows.length === 0)
@@ -769,7 +974,28 @@ function determineIfStableInLaterUnits(conn, earlier_unit, arrLaterUnits, handle
 									//console.log('filtered:', arrFilteredAltBranchRootUnits);
 									if (arrFilteredAltBranchRootUnits.length === 0)
 										return handleBestChildrenList([]);
-									goDownAndCollectBestChildren(arrFilteredAltBranchRootUnits, cb);
+									var arrInitialBestChildren = _.clone(arrBestChildren);
+									var start_time = Date.now();
+									if (conf.bFaster)
+										return collectBestChildren(arrFilteredAltBranchRootUnits, function(){
+											console.log("collectBestChildren took "+(Date.now()-start_time)+"ms");
+											cb();
+										});
+									goDownAndCollectBestChildrenOld(arrFilteredAltBranchRootUnits, function(){
+										console.log("goDownAndCollectBestChildrenOld took "+(Date.now()-start_time)+"ms");
+										var arrBestChildren1 = _.clone(arrBestChildren.sort());
+										arrBestChildren = arrInitialBestChildren;
+										start_time = Date.now();
+										collectBestChildren(arrFilteredAltBranchRootUnits, function(){
+											console.log("collectBestChildren took "+(Date.now()-start_time)+"ms");
+											arrBestChildren.sort();
+											if (!_.isEqual(arrBestChildren, arrBestChildren1)){
+												throwError("different best children, old "+arrBestChildren1.join(', ')+'; new '+arrBestChildren.join(', ')+', later '+arrLaterUnits.join(', ')+', earlier '+earlier_unit+", global db? = "+(conn === db));
+												arrBestChildren = arrBestChildren1;
+											}
+											cb();
+										});
+									});
 								}
 							);
 						});
@@ -785,7 +1011,7 @@ function determineIfStableInLaterUnits(conn, earlier_unit, arrLaterUnits, handle
 					//console.log("min mc wl", min_mc_wl);
 					determineIfHasAltBranches(function(bHasAltBranches){
 						if (!bHasAltBranches){
-							//console.log("no alt");
+							console.log("determineIfStableInLaterUnits no alt took "+(Date.now()-start_time)+"ms");
 							if (min_mc_wl >= first_unstable_mc_level) 
 								return handleResult(true);
 							return handleResult(false);
@@ -805,26 +1031,15 @@ function determineIfStableInLaterUnits(conn, earlier_unit, arrLaterUnits, handle
 							*/
 						}
 						// has alt branches
+						if (first_unstable_mc_index >= constants.altBranchByBestParentUpgradeMci && min_mc_wl < first_unstable_mc_level){
+							console.log("determineIfStableInLaterUnits min_mc_wl < first_unstable_mc_level with branches: not stable took "+(Date.now()-start_time)+"ms");
+							return handleResult(false);
+						}
 						createListOfBestChildrenIncludedByLaterUnits(arrAltBranchRootUnits, function(arrAltBestChildren){
-							//throw arrAltBestChildren;
-							// Compose a set S of units that increase WL, that is their own WL is greater than that of every parent. 
-							// In this set, find max L. Alt WL will never reach it. If min_mc_wl > L, next MC unit is stable.
-							// Also filter the set S to include only those units that are conformant with the last stable MC unit.
-							conn.query(
-								"SELECT MAX(units.level) AS max_alt_level \n\
-								FROM units \n\
-								LEFT JOIN parenthoods ON units.unit=child_unit \n\
-								LEFT JOIN units AS punits ON parent_unit=punits.unit AND punits.witnessed_level >= units.witnessed_level \n\
-								WHERE units.unit IN(?) AND punits.unit IS NULL AND ( \n\
-									SELECT COUNT(*) \n\
-									FROM unit_witnesses \n\
-									WHERE unit_witnesses.unit IN(units.unit, units.witness_list_unit) AND unit_witnesses.address IN(?) \n\
-								)>=?",
-								[arrAltBestChildren, arrWitnesses, constants.COUNT_WITNESSES - constants.MAX_WITNESS_LIST_MUTATIONS],
-								function(max_alt_rows){
-									if (max_alt_rows.length !== 1)
-										throw Error("not a single max alt level");
-									var max_alt_level = max_alt_rows[0].max_alt_level;
+							determineMaxAltLevel(
+								conn, first_unstable_mc_index, first_unstable_mc_level, arrAltBestChildren, arrWitnesses,
+								function(max_alt_level){
+									console.log("determineIfStableInLaterUnits with branches took "+(Date.now()-start_time)+"ms");
 									// allow '=' since alt WL will *never* reach max_alt_level.
 									// The comparison when moving the stability point above is still strict for compatibility
 									handleResult(min_mc_wl >= max_alt_level);
@@ -868,7 +1083,7 @@ function determineIfStableInLaterUnitsAndUpdateStableMcFlag(conn, earlier_unit, 
 							markMcIndexStable(conn, mci, advanceLastStableMcUnitAndStepForward);
 						else{
 							unlock();
-							handleResult(bStable);
+							handleResult(bStable, true);
 						}
 					}            
 				});
@@ -892,11 +1107,13 @@ function readBestParentAndItsWitnesses(conn, unit, handleBestParentAndItsWitness
 function markMcIndexStable(conn, mci, onDone){
 	profiler.start();
 	var arrStabilizedUnits = [];
+	storage.assocStableUnitsByMci[mci] = [];
 	for (var unit in storage.assocUnstableUnits){
 		var o = storage.assocUnstableUnits[unit];
 		if (o.main_chain_index === mci && o.is_stable === 0){
 			o.is_stable = 1;
 			storage.assocStableUnits[unit] = o;
+			storage.assocStableUnitsByMci[mci].push(o);
 			arrStabilizedUnits.push(unit);
 		}
 	}
@@ -933,7 +1150,10 @@ function markMcIndexStable(conn, mci, onDone){
 							console.log("unit "+row.unit+" has competitors "+arrConflictingUnits+", it becomes "+sequence);
 							conn.query("UPDATE units SET sequence=? WHERE unit=?", [sequence, row.unit], function(){
 								if (sequence === 'good')
-									conn.query("UPDATE inputs SET is_unique=1 WHERE unit=?", [row.unit], function(){ cb(); });
+									conn.query("UPDATE inputs SET is_unique=1 WHERE unit=?", [row.unit], function(){
+										storage.assocStableUnits[row.unit].sequence = 'good';
+										cb();
+									});
 								else{
 									arrFinalBadUnits.push(row.unit);
 									setContentHash(row.unit, cb);
@@ -1154,6 +1374,7 @@ function getSimilarMcis(mci){
 }
 
 function throwError(msg){
+	debugger;
 	if (typeof window === 'undefined')
 		throw Error(msg);
 	else

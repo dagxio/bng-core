@@ -2,6 +2,7 @@
 "use strict";
 var async = require('async');
 var storage = require('./storage.js');
+var archiving = require('./archiving.js');
 var objectHash = require("./object_hash.js");
 var db = require('./db.js');
 var mutex = require('./mutex.js');
@@ -15,7 +16,7 @@ var parentComposer = require('./parent_composer.js');
 var breadcrumbs = require('./breadcrumbs.js');
 var eventBus = require('./event_bus.js');
 
-var MAX_HISTORY_ITEMS = 1000;
+var MAX_HISTORY_ITEMS = 2000;
 
 // unit's MC index is earlier_mci
 function buildProofChain(later_mci, earlier_mci, unit, arrBalls, onDone){
@@ -269,7 +270,7 @@ function prepareHistory(historyRequest, callbacks){
 }
 
 
-function processHistory(objResponse, callbacks){
+function processHistory(objResponse, arrWitnesses, callbacks){
 	if (!("joints" in objResponse)) // nothing found
 		return callbacks.ifOk(false);
 	if (!ValidationUtils.isNonemptyArray(objResponse.unstable_mc_joints))
@@ -284,7 +285,7 @@ function processHistory(objResponse, callbacks){
 		objResponse.proofchain_balls = [];
 
 	witnessProof.processWitnessProof(
-		objResponse.unstable_mc_joints, objResponse.witness_change_and_definition_joints, false, 
+		objResponse.unstable_mc_joints, objResponse.witness_change_and_definition_joints, false, arrWitnesses,
 		function(err, arrLastBallUnits, assocLastBallByLastBallUnit){
 			
 			if (err)
@@ -339,6 +340,7 @@ function processHistory(objResponse, callbacks){
 					rows.forEach(function(row){
 						assocExistingUnits[row.unit] = true;
 					});
+					var arrNewUnits = [];
 					var arrProvenUnits = [];
 					async.eachSeries(
 						objResponse.joints.reverse(), // have them in forward chronological order so that we correctly mark is_spent flag
@@ -359,12 +361,23 @@ function processHistory(objResponse, callbacks){
 									"UPDATE units SET main_chain_index=?, sequence=? WHERE unit=?", 
 									[objUnit.main_chain_index, sequence, unit], 
 									function(){
-										cb2();
+										if (sequence === 'good')
+											return cb2();
+										// void the final-bad
+										breadcrumbs.add('will void '+unit);
+										db.executeInTransaction(function doWork(conn, cb3){
+											var arrQueries = [];
+											archiving.generateQueriesToArchiveJoint(conn, objJoint, 'voided', arrQueries, function(){
+												async.series(arrQueries, cb3);
+											});
+										}, cb2);
 									}
 								);
 							}
-							else
+							else{
+								arrNewUnits.push(unit);
 								writer.saveJoint(objJoint, {sequence: sequence, arrDoubleSpendInputs: [], arrAdditionalQueries: []}, null, cb2);
+							}
 						},
 						function(err){
 							breadcrumbs.add('processHistory almost done');
@@ -373,6 +386,8 @@ function processHistory(objResponse, callbacks){
 								return callbacks.ifError(err);
 							}
 							fixIsSpentFlagAndInputAddress(function(){
+								if (arrNewUnits.length > 0)
+									emitNewMyTransactions(arrNewUnits);
 								if (arrProvenUnits.length === 0){
 									unlock();
 									return callbacks.ifOk(true);
@@ -402,7 +417,7 @@ function fixIsSpentFlag(onDone){
 	db.query(
 		"SELECT outputs.unit, outputs.message_index, outputs.output_index \n\
 		FROM outputs \n\
-		JOIN inputs ON outputs.unit=inputs.src_unit AND outputs.message_index=inputs.src_message_index AND outputs.output_index=inputs.src_output_index \n\
+		CROSS JOIN inputs ON outputs.unit=inputs.src_unit AND outputs.message_index=inputs.src_message_index AND outputs.output_index=inputs.src_output_index \n\
 		WHERE is_spent=0 AND type='transfer'",
 		function(rows){
 			console.log(rows.length+" previous outputs appear to be spent");
@@ -464,22 +479,40 @@ function determineIfHaveUnstableJoints(arrAddresses, handleResult){
 	);
 }
 
-function emitStability(arrProvenUnits, onDone){
-	var strUnitList = arrProvenUnits.map(db.escape).join(', ');
-	db.query(
-		"SELECT unit FROM unit_authors JOIN my_addresses USING(address) WHERE unit IN("+strUnitList+") \n\
+function getSqlToFilterMyUnits(arrUnits){
+	var strUnitList = arrUnits.map(db.escape).join(', ');
+	return "SELECT unit FROM unit_authors JOIN my_addresses USING(address) WHERE unit IN("+strUnitList+") \n\
 		UNION \n\
 		SELECT unit FROM outputs JOIN my_addresses USING(address) WHERE unit IN("+strUnitList+") \n\
 		UNION \n\
 		SELECT unit FROM unit_authors JOIN shared_addresses ON address=shared_address WHERE unit IN("+strUnitList+") \n\
 		UNION \n\
-		SELECT unit FROM outputs JOIN shared_addresses ON address=shared_address WHERE unit IN("+strUnitList+")",
+		SELECT unit FROM outputs JOIN shared_addresses ON address=shared_address WHERE unit IN("+strUnitList+")";
+}
+
+function emitStability(arrProvenUnits, onDone){
+	db.query(
+		getSqlToFilterMyUnits(arrProvenUnits),
 		function(rows){
 			onDone(rows.length > 0);
 			if (rows.length > 0){
 				eventBus.emit('my_transactions_became_stable', rows.map(function(row){ return row.unit; }));
 				rows.forEach(function(row){
 					eventBus.emit('my_stable-'+row.unit);
+				});
+			}
+		}
+	);
+}
+
+function emitNewMyTransactions(arrNewUnits){
+	db.query(
+		getSqlToFilterMyUnits(arrNewUnits),
+		function(rows){
+			if (rows.length > 0){
+				eventBus.emit('new_my_transactions', rows.map(function(row){ return row.unit; }));
+				rows.forEach(function(row){
+					eventBus.emit("new_my_unit-"+row.unit);
 				});
 			}
 		}
@@ -559,9 +592,9 @@ function createLinkProof(later_unit, earlier_unit, arrChain, cb){
 					ifFound: function(objEarlierJoint){
 						var earlier_mci = objEarlierJoint.unit.main_chain_index;
 						var earlier_unit = objEarlierJoint.unit.unit;
-						if (later_mci < earlier_mci)
+						if (later_mci < earlier_mci && later_mci !== null && earlier_mci !== null)
 							return cb("not included");
-						if (later_lb_mci >= earlier_mci){ // was spent when confirmed
+						if (later_lb_mci >= earlier_mci && earlier_mci !== null){ // was spent when confirmed
 							// includes the ball of earlier unit
 							buildProofChain(later_lb_mci + 1, earlier_mci, earlier_unit, arrChain, function(){
 								cb();
@@ -608,7 +641,9 @@ function buildPath(objLaterJoint, objEarlierJoint, arrChain, onDone){
 			function(rows){
 				if (rows.length !== 1)
 					throw Error("goUp not 1 parent");
-				if (rows[0].main_chain_index < objEarlierJoint.unit.main_chain_index) // jumped over the target
+				if (rows[0].unit === objEarlierJoint.unit.unit)
+					return onDone();
+				if (rows[0].main_chain_index < objEarlierJoint.unit.main_chain_index && rows[0].main_chain_index !== null) // jumped over the target
 					return buildPathToEarlierUnit(objChildJoint);
 				addJoint(rows[0].unit, function(objJoint){
 					(objJoint.unit.main_chain_index === objEarlierJoint.unit.main_chain_index) ? buildPathToEarlierUnit(objJoint) : goUp(objJoint);
@@ -618,13 +653,15 @@ function buildPath(objLaterJoint, objEarlierJoint, arrChain, onDone){
 	}
 	
 	function buildPathToEarlierUnit(objJoint){
+		if (objJoint.unit.main_chain_index === undefined)
+			throw Error("mci undefined? unit="+objJoint.unit.unit+", mci="+objJoint.unit.main_chain_index+", earlier="+objEarlierJoint.unit.unit+", later="+objLaterJoint.unit.unit);
 		db.query(
 			"SELECT unit FROM parenthoods JOIN units ON parent_unit=unit \n\
-			WHERE child_unit=? AND main_chain_index=?", 
-			[objJoint.unit.unit, objJoint.unit.main_chain_index],
+			WHERE child_unit=?",// AND main_chain_index"+(objJoint.unit.main_chain_index === null ? ' IS NULL' : '='+objJoint.unit.main_chain_index), 
+			[objJoint.unit.unit],
 			function(rows){
 				if (rows.length === 0)
-					throw Error("no parents with same mci?");
+					throw Error("no parents with same mci? unit="+objJoint.unit.unit+", mci="+objJoint.unit.main_chain_index+", earlier="+objEarlierJoint.unit.unit+", later="+objLaterJoint.unit.unit);
 				var arrParentUnits = rows.map(function(row){ return row.unit });
 				if (arrParentUnits.indexOf(objEarlierJoint.unit.unit) >= 0)
 					return onDone();
