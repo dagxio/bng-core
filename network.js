@@ -2084,21 +2084,7 @@ function handleJustsaying(ws, subject, body){
 			if (!objJoint || !objJoint.unit || !objJoint.unit.unit)
 				return sendError(ws, 'no unit');
 			// rpc get new unit notify
-			/*try {
-				if (objJoint.unit.messages !== undefined)
-					for (let i = 0; i < objJoint.unit.messages.length; i++) {
-						if (objJoint.unit.messages[i].app === "payment" && objJoint.unit.messages[i].payload.asset === conf.ynasset) {
-							for (let pay in objJoint.unit.messages[i].payload.outputs) {
-								if (objJoint.unit.messages[i].payload.outputs.hasOwnProperty(pay)) {
-									eventBus.emit('new_unit' + objJoint.unit.messages[i].payload.outputs[pay].address, objJoint.unit.messages[i].payload.outputs[pay].amount);
-								}
-							}
-							break;
-						}
-					}
-			} catch (e) {
-				return console.error('new_unit emit failed' + message);
-			}*/
+			// eventBus.emit('new_unit', objJoint);
 			if (objJoint.ball && !storage.isGenesisUnit(objJoint.unit.unit))
 				return sendError(ws, 'only requested joint can contain a ball');
 			if (conf.bLight && !ws.bLightVendor)
