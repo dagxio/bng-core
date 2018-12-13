@@ -2068,6 +2068,7 @@ exports.readSharedBalance = readSharedBalance;
 exports.readBalance = readBalance;
 exports.readBalancesOnAddresses = readBalancesOnAddresses;
 exports.readAssetMetadata = readAssetMetadata;
+exports.fetchAssetMetadata = fetchAssetMetadata;
 exports.readTransactionHistory = readTransactionHistory;
 exports.sendPaymentFromWallet = sendPaymentFromWallet;
 exports.sendMultiPayment = sendMultiPayment;
