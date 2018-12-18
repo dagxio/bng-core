@@ -400,7 +400,7 @@ function composeAndSaveMinimalDivisibleAssetPaymentJoint(params){
 	composeMinimalDivisibleAssetPaymentJoint(params_with_save);
 }
 
-
+exports.getSavingCallbacks = getSavingCallbacks;
 exports.validateAndSavePrivatePaymentChain = validateAndSavePrivatePaymentChain;
 exports.composeAndSaveDivisibleAssetPaymentJoint = composeAndSaveDivisibleAssetPaymentJoint;
 exports.composeAndSaveMinimalDivisibleAssetPaymentJoint = composeAndSaveMinimalDivisibleAssetPaymentJoint;
