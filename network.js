@@ -2832,7 +2832,7 @@ function handleRequest(ws, tag, command, params){
 			var asset = params;
 			if (!ValidationUtils.isStringOfLength(asset, constants.HASH_LENGTH))
 				return sendErrorResponse(ws, tag, "bad asset: "+asset);
-			db.query("SELECT metadata_unit, registry_address, suffix FROM asset_metadata WHERE asset=?", [asset], function(rows){
+			db.query("SELECT metadata_unit, registry_address, suffix, name FROM asset_metadata WHERE asset=?", [asset], function(rows){
 				if (rows.length === 0)
 					return sendErrorResponse(ws, tag, "no metadata");
 				sendResponse(ws, tag, rows[0]);
